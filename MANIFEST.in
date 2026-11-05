@@ -1,0 +1,101 @@
+# Source distributions contain only reviewed runtime sources and their required assets.
+include README.md pyproject.toml uv.lock
+recursive-include domain *.py
+recursive-include infra *.py *.sql
+recursive-include interfaces *.py *.html *.css *.js *.svg
+recursive-include orchestration *.py
+recursive-include framework *.py *.mjs
+include framework/agent_runtime/pi/node/package.json
+include framework/agent_runtime/pi/node/package-lock.json
+include framework/agent_runtime/pi/node/platform-runner.mjs
+include infra/platform_migrations/versions/*.sql
+
+# Exclude local configuration, private material, docs, tests and exports.
+prune .git
+prune .local
+prune config
+prune docs
+prune tests
+prune var
+prune logs
+prune build
+prune dist
+prune exports
+prune backups
+
+# Exclude sensitive/local directories at both source-root and nested levels.
+prune domain/private
+prune domain/secrets
+prune domain/credentials
+prune domain/config
+prune domain/.local
+prune domain/.local-deploy
+prune domain/.git
+prune domain/**/private
+prune domain/**/secrets
+prune domain/**/credentials
+prune domain/**/config
+prune domain/**/.local
+prune domain/**/.local-deploy
+prune domain/**/.git
+prune infra/private
+prune infra/secrets
+prune infra/credentials
+prune infra/config
+prune infra/.local
+prune infra/.local-deploy
+prune infra/.git
+prune infra/**/private
+prune infra/**/secrets
+prune infra/**/credentials
+prune infra/**/config
+prune infra/**/.local
+prune infra/**/.local-deploy
+prune infra/**/.git
+prune interfaces/private
+prune interfaces/secrets
+prune interfaces/credentials
+prune interfaces/config
+prune interfaces/.local
+prune interfaces/.local-deploy
+prune interfaces/.git
+prune interfaces/**/private
+prune interfaces/**/secrets
+prune interfaces/**/credentials
+prune interfaces/**/config
+prune interfaces/**/.local
+prune interfaces/**/.local-deploy
+prune interfaces/**/.git
+prune orchestration/private
+prune orchestration/secrets
+prune orchestration/credentials
+prune orchestration/config
+prune orchestration/.local
+prune orchestration/.local-deploy
+prune orchestration/.git
+prune orchestration/**/private
+prune orchestration/**/secrets
+prune orchestration/**/credentials
+prune orchestration/**/config
+prune orchestration/**/.local
+prune orchestration/**/.local-deploy
+prune orchestration/**/.git
+prune framework/private
+prune framework/secrets
+prune framework/credentials
+prune framework/config
+prune framework/.local
+prune framework/.local-deploy
+prune framework/.git
+prune framework/**/private
+prune framework/**/secrets
+prune framework/**/credentials
+prune framework/**/config
+prune framework/**/.local
+prune framework/**/.local-deploy
+prune framework/**/.git
+
+exclude dev-config.txt
+recursive-exclude * __pycache__ *.py[cod] *.env *.pem *.key *.p12 *.pfx *.jks *.keystore *.log *.db *.sqlite* *.dump *.backup *.bak *.jsonl *.ndjson *.csv *.zip *.tar *.tar.gz *.tgz *.7z *.whl *.har *.pcap *.trace *.pdf *.docx *.xlsx
+recursive-exclude * .env*
+recursive-exclude * secrets credentials private .local .local-deploy

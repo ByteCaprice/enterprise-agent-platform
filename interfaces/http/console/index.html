@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Enterprise AI · Workspace</title>
+  <link rel="icon" href="/console/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/console/app.css">
+  <script type="module" src="/console/app.js"></script>
+</head>
+<body>
+  <div class="workspace">
+    <aside class="sidebar">
+      <a class="brand" href="/console/" aria-label="Enterprise AI 首页"><span class="brand-mark">e<span>·</span></span><span>Enterprise AI<small>GOVERNED WORKSPACE</small></span></a>
+      <div class="workspace-label">工作空间 <span class="version">PLATFORM / 01</span></div>
+      <nav aria-label="主要导航">
+        <button class="nav-item active" data-page="tasks"><span>◈</span> 任务工作台 <span class="nav-note">01</span></button>
+        <button class="nav-item" data-page="capabilities"><span>▦</span> 能力与 Prompt <span class="nav-note">02</span></button>
+        <button class="nav-item" data-page="resources"><span>⎇</span> 模型与工具 <span class="nav-note">03</span></button>
+        <button class="nav-item" data-page="governance"><span>◎</span> 项目与授权 <span class="nav-note">04</span></button>
+        <button class="nav-item" data-page="operations"><span>◉</span> 运营与质量 <span class="nav-note">05</span></button>
+      </nav>
+      <div class="sidebar-bottom"><span class="status-dot"></span> 独立执行 · 统一治理<p>Agent 负责推理与工具选择。<br>平台负责权限、执行权与结果。</p><a href="/docs" target="_blank" rel="noreferrer">API reference ↗</a></div>
+    </aside>
+    <div class="main-wrap">
+      <header class="topbar"><span class="breadcrumb">Workspace <span>/</span> <strong id="project-label">未连接</strong></span><div class="top-actions"><span id="session-label" class="subtle">密钥仅在当前页面内存中</span><button id="disconnect" class="button ghost" hidden>断开连接</button></div></header>
+      <main>
+        <section class="page-heading"><div><div class="eyebrow">BUILD WITH INTENT.</div><h1 id="page-title">让执行过程清晰可见<span>。</span></h1><p id="page-description">从一个有界任务开始，连接能力、Agent 与真实执行证据。</p></div><span class="heading-label">CONTROL PLANE<br>+ EXECUTION PLANE</span></section>
+        <section id="connection" class="connection card">
+          <div><h2>连接你的项目</h2><p>使用平台 Key 或已绑定的 OIDC Bearer JWT。仅保存在页面内存；生产访问请使用 HTTPS。</p></div>
+          <form id="connect-form"><label>Project key<input id="project-input" name="project" placeholder="payments" required pattern="[a-z][a-z0-9_.\-]{0,99}" autocomplete="off"></label><label>认证方式<select id="auth-mode"><option value="key">平台 Key</option><option value="oidc">OIDC Bearer</option></select></label><label>凭据<input id="token-input" name="token" type="password" placeholder="当前身份的凭据" required maxlength="16384" autocomplete="off"></label><button class="button primary" type="submit">连接工作空间 <span>→</span></button></form>
+        </section>
+        <div id="notice" role="status" aria-live="polite" hidden></div>
+        <section id="view" aria-live="polite"><div class="empty-state"><div class="empty-glyph">◈</div><h2>一个任务，一条可信执行链。</h2><p>连接后可提交任务、检查真实执行树、续读持久事件并请求取消。<br>没有 Worker 时任务保持排队，控制台不会伪造执行结果。</p><div class="feature-row"><span>Version pinned</span><span>Lease fenced</span><span>Identity scoped</span></div></div></section>
+      </main>
+      <footer>ENTERPRISE AI PLATFORM <span>Clear boundaries. Real execution.</span><span>没有自动重试 · 没有隐式权限</span></footer>
+    </div>
+  </div>
+  <noscript>此控制台需要 JavaScript；所有管理操作也可使用同源 /v2 API。</noscript>
+</body>
+</html>

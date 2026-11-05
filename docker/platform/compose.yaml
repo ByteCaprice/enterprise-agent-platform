@@ -1,0 +1,48 @@
+# Requires an existing isolated platform DB. Does not create/seed/migrate any DB.
+name: enterprise-ai
+x-platform: &platform
+  image: ${PLATFORM_IMAGE:?Set a reviewed platform image tag or digest}
+  init: true
+  restart: on-failure
+  read_only: true
+  user: "10001:10001"
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=64m,mode=1777"]
+  volumes:
+    - type: bind
+      source: ${PLATFORM_CONFIG_DIR:?Set an absolute operator config directory}
+      target: /etc/enterprise-ai
+      read_only: true
+  stop_grace_period: 6m
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+services:
+  api:
+    <<: *platform
+    command: ["serve", "--config-dir", "/etc/enterprise-ai"]
+    environment: {SERVER__HOST: "0.0.0.0", SERVER__PORT: "50020"}
+    ports: ["127.0.0.1:${PLATFORM_PORT:-50020}:50020"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:50020/readyz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  workflow:
+    <<: *platform
+    command: ["worker", "--worker-id", "workflow-primary", "--config-dir", "/etc/enterprise-ai"]
+    env_file: ["${PLATFORM_WORKER_ENV_FILE:-/dev/null}"]
+  recovery:
+    <<: *platform
+    command: ["recovery-worker", "--config-dir", "/etc/enterprise-ai"]
+  agent:
+    <<: *platform
+    profiles: [agents]
+    command: ["worker", "--executors", "workflow,agent", "--workflow-agents", "--worker-id", "agent-primary", "--config-dir", "/etc/enterprise-ai"]
+    env_file: ["${PLATFORM_WORKER_ENV_FILE:-/dev/null}"]
+  callback:
+    <<: *platform
+    profiles: [callbacks]
+    command: ["callback-worker", "--worker-id", "callback-primary", "--config-dir", "/etc/enterprise-ai"]
+    env_file: ["${PLATFORM_CALLBACK_ENV_FILE:-/dev/null}"]

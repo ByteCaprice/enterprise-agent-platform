@@ -1,0 +1,10 @@
+{
+  "owner": "",
+  "identity_policy_ref": "",
+  "financial_policy_ref": "",
+  "retention_policy_ref": "",
+  "backup_restore_ref": "",
+  "incident_runbook_ref": "",
+  "edge_security_ref": "",
+  "shared_edge_limits_confirmed": false
+}
