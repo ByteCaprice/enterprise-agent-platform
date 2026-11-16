@@ -30,6 +30,14 @@ class ReadonlyToolRegistry:
     def resolve(self, key: str, version: str) -> InstalledReadonlyTool | None:
         return self._handlers.get((key, version))
 
+    @property
+    def handlers(self) -> tuple[InstalledReadonlyTool, ...]:
+        return tuple(self._handlers.values())
+
+    @property
+    def implementation_references(self):
+        return tuple(handler.implementation for handler in self._handlers.values() if handler.implementation is not None)
+
 
 class _Projection(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)

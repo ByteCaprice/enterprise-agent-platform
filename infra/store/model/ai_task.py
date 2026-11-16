@@ -30,7 +30,9 @@ class AiTask(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False)
     create_time: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     finish_time: Mapped[datetime | None] = mapped_column(UTCDateTime)
-    result: Mapped[dict[str, Any] | None] = mapped_column(JSON_VARIANT)
+    # Non-success has no result (SQL NULL), not a JSON value of null. Keep this
+    # distinction on ORM updates as well as initial admission/raw SQL writes.
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON_VARIANT(none_as_null=True))
     error_code: Mapped[str | None] = mapped_column(Text)
     cancel_request_id: Mapped[str | None] = mapped_column(Text)
     cancel_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime)

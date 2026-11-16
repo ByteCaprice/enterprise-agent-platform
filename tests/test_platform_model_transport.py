@@ -6,7 +6,12 @@ from infra.model_credentials import EnvironmentCredentialResolver, credential_va
 from infra.model_http import OpenAICompatibleTransport
 
 
-@pytest.mark.asyncio
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
 async def test_pinned_http_transport_preserves_host_sni_and_response_fields():
     observed = {}
 
@@ -37,7 +42,7 @@ async def test_pinned_http_transport_preserves_host_sni_and_response_fields():
     assert result.usage.prompt_tokens == 4 and result.usage.completion_tokens == 2
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_transport_rejects_any_private_dns_answer():
     async def resolver(_host):
         return ["8.8.8.8", "127.0.0.1"]
@@ -61,7 +66,7 @@ def test_environment_credentials_are_scoped_and_secret_is_not_represented(monkey
     assert error.value.code == "MODEL_CREDENTIAL_UNAVAILABLE"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize("message,reason,code", [
     ({"content": "{}", "refusal": "denied"}, "stop", "MODEL_RESPONSE_REFUSED"),
     ({"content": "{}", "tool_calls": [{"type": "function"}]}, "stop", "MODEL_TOOL_CALL_REJECTED"),
@@ -70,7 +75,9 @@ def test_environment_credentials_are_scoped_and_secret_is_not_represented(monkey
 ])
 async def test_refusal_tools_and_truncation_cannot_be_success(message, reason, code):
     async def handler(_request):
-        return httpx.Response(200, json={"model": "m", "choices": [{"finish_reason": reason, "message": message}]})
+        return httpx.Response(200, json={"model": "m", "choices": [{"finish_reason": reason, "message": message}],
+                                         "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}},
+                              headers={"x-request-id": "rejected-response"})
 
     async def resolver(_host):
         return ["8.8.8.8"]
@@ -83,9 +90,12 @@ async def test_refusal_tools_and_truncation_cannot_be_success(message, reason, c
     with pytest.raises(ModelTransportFailure) as error:
         await OpenAICompatibleTransport(client_factory=factory, resolver=resolver).complete(request)
     assert error.value.code == code and not error.value.retryable
+    assert error.value.evidence.response == "received" and error.value.evidence.acceptance == "rejected"
+    assert error.value.evidence.usage.total_tokens == 6 and error.value.evidence.actual_model == "m"
+    assert error.value.evidence.request_id == "rejected-response"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize("address", ["4000::1", "127.0.0.1", "::ffff:127.0.0.1", "224.0.0.1"])
 async def test_special_dns_addresses_are_rejected_before_http(address):
     async def resolver(_host):

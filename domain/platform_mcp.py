@@ -14,6 +14,8 @@ from domain.schema_validation import JSONValidationError, ensure_self_contained_
 from domain.task import canonical_json
 
 RemoteToolName = Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]{1,128}$")]
+MCP_TEXT_OUTPUT_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}},
+                          "required": ["text"], "additionalProperties": False}
 
 
 class MCPConnection(BaseModel):
@@ -22,7 +24,7 @@ class MCPConnection(BaseModel):
     project_key: Key
     key: Key
     endpoint: str = Field(max_length=2048)
-    credential_ref: Key
+    credential_ref: Key | None = None
     transport: Literal["streamable_http_json"]
     protocol_version: Literal["2025-06-18"] = "2025-06-18"
 
@@ -44,6 +46,7 @@ class MCPToolPin(BaseModel):
     operation_type: Literal["read_only"]
     input_schema: dict
     output_schema: dict
+    result_mode: Literal["structured", "text"] = "structured"
 
     @field_validator("input_schema", "output_schema")
     @classmethod
@@ -61,11 +64,19 @@ class MCPToolPin(BaseModel):
             raise ValueError("Invalid MCP JSON Schema") from None
         return value
 
+    @model_validator(mode="after")
+    def explicit_text_wrapper(self):
+        if self.result_mode == "text" and canonical_json(self.output_schema) != canonical_json(MCP_TEXT_OUTPUT_SCHEMA):
+            raise ValueError("Text MCP pins require MCP_TEXT_OUTPUT_SCHEMA")
+        return self
+
     def handler_version(self, connection: MCPConnection) -> str:
         if (self.project_key, self.connection_key) != (connection.project_key, connection.key):
             raise ValueError("MCP pin does not belong to this connection")
-        snapshot = {"profile": "enterprise-ai-mcp-json-v1", "connection": connection.model_dump(mode="json"),
-                    "tool": self.model_dump(mode="json")}
+        tool = self.model_dump(mode="json")
+        if self.result_mode == "structured":
+            tool.pop("result_mode")  # Preserve existing authenticated structured handler versions.
+        snapshot = {"profile": "enterprise-ai-mcp-json-v1", "connection": connection.model_dump(mode="json"), "tool": tool}
         return hashlib.sha256(canonical_json(snapshot).encode()).hexdigest()
 
 

@@ -8,8 +8,8 @@ from sqlalchemy import BigInteger, CheckConstraint, ForeignKeyConstraint, Index,
 from sqlalchemy.orm import Mapped, mapped_column
 
 from domain.platform_model import PlatformModelCallRecord
+from infra.store.model.base import JSON_VARIANT, UTCDateTime
 from infra.store.model.base import PlatformBase as Base
-from infra.store.model.base import UTCDateTime
 
 
 class AiPlatformModelCall(Base):
@@ -42,6 +42,7 @@ class AiPlatformModelCall(Base):
     http_status: Mapped[int | None] = mapped_column(Integer)
     provider_request_id: Mapped[str | None] = mapped_column(Text)
     error_code: Mapped[str | None] = mapped_column(Text)
+    outbound_evidence: Mapped[dict | None] = mapped_column(JSON_VARIANT(none_as_null=True), nullable=True)
     start_time: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     finish_time: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
@@ -64,6 +65,8 @@ class AiPlatformModelCall(Base):
         CheckConstraint("(prompt_tokens IS NULL OR prompt_tokens >= 0) AND (completion_tokens IS NULL OR completion_tokens >= 0) AND (total_tokens IS NULL OR total_tokens >= 0)", name="ck_ai_platform_model_call_usage"),
         CheckConstraint("http_status IS NULL OR http_status BETWEEN 100 AND 599", name="ck_ai_platform_model_call_http"),
         CheckConstraint("provider_request_id IS NULL OR length(provider_request_id) <= 512", name="ck_ai_platform_model_call_request_id"),
+        CheckConstraint("outbound_evidence IS NULL OR jsonb_typeof(outbound_evidence) = 'object'",
+                        name="ck_ai_platform_model_call_outbound_evidence"),
         Index("idx_ai_platform_model_call_owner", "project_key", "task_id", "start_time"),
         Index("idx_ai_platform_model_call_node", "task_id", "task_attempt_id", "node_id", "start_time"),
         Index("uk_ai_platform_model_call_running", "node_id", unique=True, postgresql_where=text("status = 'running'")),

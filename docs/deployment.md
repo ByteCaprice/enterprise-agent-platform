@@ -21,6 +21,8 @@ enterprise-ai check-config --config-dir /path/to/platform-config
 
 平台迁移目录为 `infra/platform_migrations/`，初始化 baseline 为 `0001_platform`，固定 SQL 位于 `versions/schema.sql`。只在获批的空隔离 schema 中初始化；应用启动不会创建表、导入业务 seed 或自动修改 schema。
 
+源码中的 schema head 为尚未发布的 `0003_business_code`。增量 `0002_outbound_evidence` 在模型调用记录上增加安全 outbound evidence；本次细化直接在未发布的 `0003_business_code` 中扩展节点 kind/status、scope 和父级约束，并允许 `workflow:invoke` 资源授权，支持代码活动调用层级及 unavailable 证据。冻结的 `0001_platform` / `0002_outbound_evidence` 不变，不创建业务能力、修改已有定义或重放任务，也不表示已验证或升级整个运行环境。运行对应应用前仍须按授权显式升级；缺少历史证据的调用不会获得 fallback 许可。所有增量都不修改 baseline，也不自动运行。降级删除调用或执行证据须另行授权，不能通过 downgrade 丢弃。
+
 首次初始化仅能由管理员在获批空 schema 执行。仓库提供 `scripts/bootstrap_platform_sit.py` 测试初始化工具，默认预检，显式 `--apply` 才创建；它仅用于隔离测试环境，不是生产自动部署入口。
 
 已有平台先停止写入与所有 Worker、排空运行任务，并备份/演练，再执行：
@@ -50,12 +52,20 @@ enterprise-ai serve --config-dir /path/to/platform-config
 enterprise-ai worker --config-dir /path/to/platform-config
 # 根 Agent 和内嵌 Agent 均显式启用：
 enterprise-ai worker --executors workflow,agent --workflow-agents --config-dir /path/to/platform-config
+# 在上述角色基础上，显式安装审核过的业务包：
+enterprise-ai worker --executors workflow,agent --workflow-agents --hub-bundles remitter-search --config-dir /path/to/platform-config
 # 独立通知投递：
 enterprise-ai callback-worker --config-dir /path/to/platform-config
 enterprise-ai recovery-worker --config-dir /path/to/platform-config
 ```
 
 API 不自动启动 Worker。API 与 Task Worker 启动时会进行本地 Schema 验证后端握手；该握手不调用 Provider、模型、工具或数据库，也不是按请求探测外部服务。Pi Agent 需要 Node22.19+ 以及已安装的锁定 npm 依赖；`enterprise-ai check-release --pi` 检查本地 Node/Pi 握手，不调用模型或外部服务。需要 MCP 时显式提供经审核的目录，并先用 `check-mcp-catalog` 校验。
+
+MCP 目录、Tool binding、Agent 的 tools/skills 引用和对应 Grant 是分别配置的环节；文件校验不会探测远程服务或自动授予工具。当前只支持受控 Streamable HTTP JSON 只读工具，不是任意 MCP 服务即插即用。详见 [Skills、MCP 与 Pi 配置](agent-skills-mcp.md)。
+
+Task Worker 从实际安装的节点适配器和已检查 Runtime 形成不可变能力清单，领取前核对固定制品及相关依赖要求的语义 profile，而非只看执行角色。根 Agent 和内嵌 Agent 都需要匹配的 Runtime；当前 V1 只定义 `pi → enterprise-ai.pi.v1`。不兼容或制品完整性异常的任务仍排队，不消耗 Attempt，不自动安装代码或切换 Runtime。部署需覆盖实际能力需求；现有健康心跳中的角色/存活是粗粒度观察，不是 profile 兼容证书或执行授权。工具 binding/handler、Provider 和凭据仍在实际调用时检查。
+
+`--hub-bundles` 仅从同发行物的显式业务目录安装代码，不读取数据库中的模块路径。代码流程/工具还要求实现 Key、版本、来源摘要完全相同；发布新业务版本不让旧 Worker 自动兼容。源码变化后重新发布并部署对应实现，不通过线上热改文件切换历史版本。具体命令与发布/授权边界见[业务能力 Hub](capability-hub.md)。
 
 ## 制品与容器
 

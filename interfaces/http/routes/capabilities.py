@@ -18,7 +18,9 @@ from domain.capability import (
     CapabilityVersionRecord,
     PromptRenderRequest,
 )
+from domain.code_workflow_plan import CodeWorkflowPlanRecord
 from domain.workflow import WorkflowPlanRecord
+from infra.schema_validation import IsolatedJSONValidator
 from interfaces.http.api_models import PromptRenderResponse
 from interfaces.http.platform_auth import capability_access
 from orchestration.capability_service import CapabilityService
@@ -37,7 +39,7 @@ RenderActor = Annotated[str, Depends(capability_access("prompt:render"))]
 
 
 def _service(request):
-    return CapabilityService(request.app.state.store.capabilities)
+    return CapabilityService(request.app.state.store.capabilities, IsolatedJSONValidator())
 
 
 def _call(operation, *args):
@@ -94,7 +96,7 @@ def get_version(request: Request, project_key: str, key: str, version: str, _act
     return _call(request.app.state.store.capabilities.get_version, project_key, key, version)
 
 
-@router.get("/capabilities/{key}/versions/{version}/plan", response_model=WorkflowPlanRecord)
+@router.get("/capabilities/{key}/versions/{version}/plan", response_model=WorkflowPlanRecord | CodeWorkflowPlanRecord)
 def get_workflow_plan(request: Request, project_key: str, key: str, version: str, _actor: ReadActor):
     return _call(WorkflowPlanQuery(request.app.state.store.capabilities).describe, project_key, key, version)
 

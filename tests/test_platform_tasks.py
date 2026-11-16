@@ -17,11 +17,13 @@ from test_platform_migrations import config_for
 
 from domain import ApiKeyConfig
 from domain.capability import CapabilitySpec, CapabilityVersionDraft
+from domain.capability_definitions import WORKFLOW_CHECKPOINT_PROFILE, WORKFLOW_INTERPRETER_PROFILE
 from domain.governance import AccessKeyCreate, ProjectCreate, ResourceGrantCreate, ServiceIdentityCreate
 from domain.task import TaskConflict, TaskSubmit
 from infra.platform_store import PlatformStore
+from infra.schema_validation import IsolatedJSONValidator
 from infra.store.model import AiTask
-from infra.store.repository.task import TaskRepository
+from infra.store.repository import task as task_repository
 from interfaces.http.platform_server import create_platform_app
 from orchestration.capability_service import CapabilityService
 from orchestration.control_plane_auth import ControlPlaneAuth
@@ -35,7 +37,7 @@ BASE = "/v2/projects/payments/tasks"
 
 @pytest.fixture
 def inbox(monkeypatch, pg_url):
-    from interfaces.http import platform_server
+    from interfaces import runtime
 
     url = fresh_database_url(pg_url)
     command.upgrade(config_for(url), "head")
@@ -48,8 +50,8 @@ def inbox(monkeypatch, pg_url):
     for key in ("payments", "other"):
         store.governance.create_project(ProjectCreate(key=key, name=key), "task-admin")
     publish(store)
-    monkeypatch.setattr(platform_server, "load_settings", lambda _path: {"database": {"schema": schema}})
-    monkeypatch.setattr(platform_server, "build_engine", lambda _settings: create_engine(url))
+    monkeypatch.setattr(runtime, "load_settings", lambda _path: {"database": {"schema": schema}})
+    monkeypatch.setattr(runtime, "build_engine", lambda _settings: create_engine(url))
     try:
         with TestClient(create_platform_app("unused")) as client:
             client.app.state.rate_limiter.settings["enabled"] = False
@@ -59,7 +61,7 @@ def inbox(monkeypatch, pg_url):
 
 
 def publish(store, key="review", version="1", project="payments", *, kind="agent", published=True):
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     if version == "1":
         service.create(project, CapabilitySpec(key=key, kind=kind, name=key), "task-admin")
     dependencies = []
@@ -92,6 +94,26 @@ def publish(store, key="review", version="1", project="payments", *, kind="agent
 def submit(client, key="request-1", headers=None, **changes):
     return client.post(BASE, headers={**(ADMIN if headers is None else headers), "Idempotency-Key": key},
                        json={"capability_key": "review", "version": "1", "input": {"name": "Synthetic customer"}, **changes})
+
+
+def publish_completion_flow(store, *, version="1", output_schema=None):
+    """A real rule contract for tests that exercise completion, not Agent runtime."""
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
+    service.create("payments", CapabilitySpec(key="completion-flow", kind="workflow", name="Completion flow"), "task-admin")
+    service.create_draft("payments", "completion-flow", CapabilityVersionDraft(
+        version=version, definition={"nodes": [{"key": "first", "kind": "rule", "rule": {"operation": "project"}}]},
+        output_schema=output_schema if output_schema is not None else {"type": "object"},
+    ), "task-admin")
+    service.publish("payments", "completion-flow", version, "task-admin")
+
+
+def record_completion_node(store, claim, result):
+    """Persist required node evidence through the public fenced checkpoint API."""
+    checkpoint = store.workflows.begin(claim.lease, "first", hashlib.sha256(b"synthetic input").hexdigest(),
+                                       interpreter_profile=WORKFLOW_INTERPRETER_PROFILE,
+                                       checkpoint_profile=WORKFLOW_CHECKPOINT_PROFILE)
+    assert checkpoint is not None and checkpoint.created
+    assert store.workflows.finish(claim.lease, checkpoint.record.id, status="succeeded", output=result)
 
 
 def test_business_and_customer_associations_are_durable_and_idempotent(inbox):
@@ -163,7 +185,7 @@ def test_idempotent_replay_conflict_and_cancel_do_not_resubmit(inbox):
 def test_concurrent_submission_and_cancel_have_one_record_and_one_event(inbox):
     client, store = inbox
     auth = ControlPlaneAuth(store.api_key_configs, store.governance)
-    service = TaskService(store, auth)
+    service = TaskService(store, auth, validator=IsolatedJSONValidator())
     principal = auth.authenticate(ADMIN_TOKEN)
     spec = TaskSubmit(capability_key="review", version="1", input={"name": "Synthetic"})
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -262,7 +284,7 @@ def test_audit_failure_rolls_back_submit_and_cancel(inbox, monkeypatch):
     def fail(*_args, **_kwargs):
         raise RuntimeError("synthetic-private-error")
 
-    monkeypatch.setattr(TaskRepository, "_audit", staticmethod(fail))
+    monkeypatch.setattr(task_repository, "record_task_transition", fail)
     with TestClient(client.app, raise_server_exceptions=False) as safe_client:
         for path, body, extra in [(BASE, {"capability_key": "review", "version": "1", "input": {"name": "secret-input"}},
                                    {"Idempotency-Key": "rollback"}),
@@ -287,7 +309,7 @@ def test_database_rejects_cross_project_task_assignment(inbox):
 
 def test_workflow_is_admitted_but_prompt_is_not_a_task(inbox):
     client, store = inbox
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     service.create("payments", CapabilitySpec(key="review-flow", kind="workflow", name="Review flow"), "task-admin")
     service.create_draft("payments", "review-flow", CapabilityVersionDraft(
         version="1", definition={"nodes": [{"key": "review", "kind": "rule", "rule": {"operation": "project"}}]},
@@ -362,7 +384,7 @@ def test_database_rejects_fabricated_success_and_inconsistent_completion_times(i
 def test_concurrent_conflicting_submissions_do_not_overwrite_the_winner(inbox):
     _, store = inbox
     auth = ControlPlaneAuth(store.api_key_configs, store.governance)
-    service = TaskService(store, auth)
+    service = TaskService(store, auth, validator=IsolatedJSONValidator())
     principal = auth.authenticate(ADMIN_TOKEN)
 
     def attempt(name):
@@ -400,5 +422,7 @@ def test_metadata_queries_and_replay_never_load_customer_input(inbox):
         assert client.post(accepted.headers["Location"] + "/cancel", headers=ADMIN).status_code == 200
     finally:
         event.remove(engine, "before_cursor_execute", record_sql)
-    assert len(statements) == 4
+    # Admission has separate preflight and locked replay reads; protect the
+    # metadata-only projection rather than its internal round-trip count.
+    assert len(statements) >= 4
     assert all("ai_task.input" not in statement for statement in statements)

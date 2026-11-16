@@ -5,8 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 from test_execution_context import claim_for
+from worker_support import worker_capabilities
 
 from domain.task_control import ControlState, ExecutionObservation
+from domain.task_worker import WorkerServices
+from infra.schema_validation import IsolatedJSONValidator
 from orchestration.platform_worker import PlatformWorker, WorkerExecutionUnstoppable, WorkerPolicy
 
 
@@ -34,10 +37,13 @@ def test_monitor_acknowledges_only_after_local_cleanup_and_poison_never_acknowle
         def no_completion(*_args, **_kwargs):
             pytest.fail("Cancellation must use its own stop acknowledgement, not ordinary completion")
 
-        store = SimpleNamespace(task_control=Control(), tasks=SimpleNamespace(
-            recover_expired=lambda: 0, reject_disabled_project_tasks=lambda: 0,
-            claim=lambda *_args, **_kwargs: claim, complete=no_completion,
-        ))
+        services = WorkerServices(
+            control=Control(), queue=SimpleNamespace(
+                recover_expired=lambda: 0, reject_disabled_project_tasks=lambda: 0,
+                claim=lambda *_args, **_kwargs: claim,
+            ), completion=SimpleNamespace(complete=no_completion),
+            authorization=SimpleNamespace(allowed=lambda _: True), validation=IsolatedJSONValidator(),
+        )
 
         class Worker(PlatformWorker):
             async def _execute(self, _claim):
@@ -53,10 +59,9 @@ def test_monitor_acknowledges_only_after_local_cleanup_and_poison_never_acknowle
         async def unused(_claim):
             return {}
 
-        worker = Worker(store, "control-check", {"workflow": unused}, policy=WorkerPolicy(
+        worker = Worker(services, "control-check", {"workflow": unused}, policy=WorkerPolicy(
             heartbeat_seconds=0.01, cancellation_grace_seconds=0.2,
-        ))
-        worker.authorizer.allowed = lambda _: True
+        ), capabilities=worker_capabilities("workflow"))
         running = asyncio.create_task(worker.run_once())
         await asyncio.wait_for(started.wait(), 1)
         intent = True

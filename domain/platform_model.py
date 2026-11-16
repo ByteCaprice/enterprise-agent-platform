@@ -12,6 +12,7 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from domain.capability import Key, ModelName
+from domain.outbound_operation import ModelUsage, OutboundEvidence
 from domain.platform_agent import CallOwnership
 from domain.task import canonical_json
 
@@ -127,14 +128,6 @@ class ModelMessages(BaseModel):
     messages: list[ModelMessage] = Field(min_length=1, max_length=100)
 
 
-class ModelUsage(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    prompt_tokens: int | None = Field(default=None, strict=True, ge=0, le=9_223_372_036_854_775_807)
-    completion_tokens: int | None = Field(default=None, strict=True, ge=0, le=9_223_372_036_854_775_807)
-    total_tokens: int | None = Field(default=None, strict=True, ge=0, le=9_223_372_036_854_775_807)
-
-
 @dataclass(frozen=True)
 class ModelSecret:
     reference: str
@@ -165,17 +158,39 @@ class ModelTransportResponse:
     http_status: int = 200
     request_id: str | None = None
 
+    @property
+    def evidence(self) -> OutboundEvidence:
+        return OutboundEvidence(dispatch="dispatched", response="received", actual_model=self.actual_model,
+                                usage=self.usage, http_status=self.http_status, request_id=self.request_id)
+
 
 class ModelTransportFailure(RuntimeError):
     """Safe transport classification; never include provider bodies or credentials."""
 
-    def __init__(self, code: str, *, http_status: int | None = None, retryable: bool = False):
+    def __init__(self, code: str, *, evidence: OutboundEvidence | None = None,
+                 http_status: int | None = None, retryable: bool = False):
         if re.fullmatch(r"MODEL_[A-Z0-9_]{1,90}", code) is None:
             raise ValueError("Invalid model transport error code")
         self.code = code
-        self.http_status = http_status
-        self.retryable = retryable
+        # A supplied status records headers only; legacy retry hints cannot grant replay.
+        self._evidence = OutboundEvidence.model_validate(evidence) if evidence is not None else OutboundEvidence(
+            dispatch="dispatched" if http_status is not None else "unknown",
+            response="headers_received" if http_status is not None else "not_received",
+            http_status=http_status,
+        )
         super().__init__(code)
+
+    @property
+    def evidence(self) -> OutboundEvidence:
+        return self._evidence
+
+    @property
+    def http_status(self) -> int | None:
+        return self.evidence.http_status
+
+    @property
+    def retryable(self) -> bool:
+        return self.code == "MODEL_UPSTREAM_UNAVAILABLE" and self.evidence.retry_permission == "safe_response"
 
 
 class ModelTransport(Protocol):

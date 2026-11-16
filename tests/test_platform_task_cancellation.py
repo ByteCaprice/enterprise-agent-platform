@@ -6,8 +6,9 @@ from dataclasses import replace
 from sqlalchemy import text
 from test_platform_agent_broker import MockTurns, make_broker
 from test_platform_agent_storage import root_fixture
-from test_platform_tasks import ADMIN, service_identity, submit
+from test_platform_tasks import ADMIN, publish_completion_flow, record_completion_node, service_identity, submit
 from test_platform_tasks import inbox as inbox_fixture
+from worker_support import worker_capabilities, worker_services
 
 from domain.task_control import ControlState
 from domain.task_execution import CompletionOutcome
@@ -27,20 +28,22 @@ def test_queued_receipt_is_idempotent_and_terminal_completion_wins(inbox):
     assert receipt["cancellation"]["state"] == "acknowledged"
     assert client.post(target + "/cancel", headers=ADMIN).json() == receipt
     assert client.get(target + "/attempts", headers=ADMIN).json() == []
-    target = submit(client, key="success-first").headers["Location"]
-    claim = store.tasks.claim("completion-first")
-    assert store.tasks.complete(claim.lease, status="succeeded", result={"ok": True}) == CompletionOutcome.COMPLETED
+    publish_completion_flow(store)
+    target = submit(client, key="success-first", capability_key="completion-flow").headers["Location"]
+    claim = store.task_queue.claim("completion-first", capabilities=worker_capabilities())
+    record_completion_node(store, claim, {"ok": True})
+    assert store.task_completion.complete(claim.lease, status="succeeded", result={"ok": True}) == CompletionOutcome.COMPLETED
     assert client.post(target + "/cancel", headers=ADMIN).status_code == 409
 
 
 def test_running_intent_defers_success_and_expired_owner_cannot_acknowledge(inbox):
     client, store = inbox
     target = submit(client).headers["Location"]
-    claim = store.tasks.claim("cancel-fence")
+    claim = store.task_queue.claim("cancel-fence", capabilities=worker_capabilities())
     receipt = client.post(target + "/cancel", headers=ADMIN)
     assert receipt.status_code == 202 and receipt.json()["task"]["status"] == "running"
     assert receipt.json()["cancellation"]["state"] == "requested"
-    assert store.tasks.complete(claim.lease, status="succeeded", result={}) == CompletionOutcome.CANCELLATION_PENDING
+    assert store.task_completion.complete(claim.lease, status="succeeded", result={}) == CompletionOutcome.CANCELLATION_PENDING
     assert not store.task_control.acknowledge_cancel(replace(claim.lease, token="0" * 64))
     observation = store.task_control.observe(claim.lease, lease_seconds=30, cancellation_grace_seconds=5)
     assert observation.state == ControlState.CANCELLATION_REQUESTED
@@ -49,7 +52,7 @@ def test_running_intent_defers_success_and_expired_owner_cannot_acknowledge(inbo
         connection.execute(text("UPDATE ai_task_attempt SET lease_expires_at=start_time WHERE id=:id"),
                            {"id": claim.lease.attempt_id})
     assert not store.task_control.acknowledge_cancel(claim.lease)
-    assert store.tasks.recover_expired() == 1
+    assert store.task_queue.recover_expired() == 1
     receipt = client.get(target + "/cancellation", headers=ADMIN).json()
     assert receipt["task"]["status"] == "failed" and receipt["cancellation"]["state"] == "unconfirmed"
     assert receipt["cancellation"]["acknowledged_at"] is None
@@ -82,7 +85,8 @@ def test_worker_discards_cancelled_model_decision_but_keeps_usage_and_real_tree(
                 stopped.set()
 
         policy = WorkerPolicy(lease_seconds=30, heartbeat_seconds=5, execution_timeout_seconds=30)
-        worker = PlatformWorker(store, "cancel-worker", {"agent": execute}, policy=policy)
+        worker = PlatformWorker(worker_services(store), "cancel-worker", {"agent": execute}, policy=policy,
+                                capabilities=worker_capabilities("agent"))
         running = asyncio.create_task(worker.run_once())
         try:
             await asyncio.wait_for(started.wait(), 15)

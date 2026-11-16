@@ -20,6 +20,7 @@ from domain.capability import (
     CapabilityVersionDraft,
 )
 from domain.governance import ProjectCreate
+from infra.schema_validation import IsolatedJSONValidator
 from interfaces.http.routes.capabilities import router
 from orchestration.capability_service import CapabilityService
 from orchestration.control_plane_auth import ControlPlaneAuth
@@ -40,7 +41,7 @@ def draft(version="1.0.0", template="Review ${name}. Return JSON.", **changes):
 def bank():
     store = make_store()
     store.governance.create_project(ProjectCreate(key="payments", name="Payments"), "admin")
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     service.create("payments", CapabilitySpec(key="review", kind="prompt", name="Review prompt"), "admin")
     return store, service
 
@@ -119,7 +120,7 @@ def test_remote_json_schema_references_are_rejected_without_network_access():
 def test_agent_definitions_cannot_embed_provider_credentials():
     store = make_store()
     store.governance.create_project(ProjectCreate(key="payments", name="Payments"), "admin")
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     service.create("payments", CapabilitySpec(key="research", kind="agent", name="Research"), "admin")
     with pytest.raises(CapabilityError, match="credential references"):
         service.create_draft("payments", "research", CapabilityVersionDraft(

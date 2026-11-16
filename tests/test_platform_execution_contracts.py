@@ -9,6 +9,7 @@ import pytest
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
+from domain.task_worker import WorkerServices
 from interfaces.http.platform_errors import http_exception_handler
 from orchestration.platform_worker import PlatformWorker, WorkerPolicy
 
@@ -27,7 +28,7 @@ def test_worker_timing_policy_is_finite_bounded_and_heartbeats_precede_expiry(ch
 @pytest.mark.parametrize("executors", [{}, {"prompt": lambda _: {}}, {"agent": None}])
 def test_worker_has_no_default_or_arbitrary_published_executor(executors):
     with pytest.raises(ValueError, match="explicit"):
-        PlatformWorker(object(), "worker", executors)
+        PlatformWorker(WorkerServices(None, None, None, None, None), "worker", executors)
 
 
 def test_http_error_never_discloses_exception_details_and_preserves_retry_headers():

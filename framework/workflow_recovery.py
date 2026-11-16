@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
+from domain.business_code import CodeWorkflowDefinition
 from domain.capability import CapabilityError, CapabilityVersionDraft
-from domain.workflow import WorkflowDefinition
+from domain.capability_definitions import interpret_definition
+from domain.workflow import WorkflowContractError
 from domain.workflow_recovery import RecoveryReason, WorkflowRecoveryAssessment
 from framework.workflow_plan import WorkflowPlanError, compile_workflow
 
@@ -35,11 +37,15 @@ def assess_workflow_recovery(
 
     if eligible:
         try:
-            definition = WorkflowDefinition.model_validate(artifact.definition)
-            plan = compile_workflow(definition)
-            if any(node.kind != "rule" for node in plan.nodes):
+            contract = interpret_definition("workflow", artifact)
+            definition = contract.materialize()
+            if isinstance(definition, CodeWorkflowDefinition):
                 eligible, reason = False, "unsupported_node_kind"
-        except WorkflowPlanError as exc:
+            else:
+                plan = compile_workflow(definition)
+                if any(node.kind != "rule" for node in plan.nodes):
+                    eligible, reason = False, "unsupported_node_kind"
+        except (WorkflowPlanError, WorkflowContractError) as exc:
             eligible = False
             reason = (
                 "retry_policy_unsupported" if exc.code == WorkflowPlanError.RETRY_NOT_SUPPORTED else "invalid_workflow"

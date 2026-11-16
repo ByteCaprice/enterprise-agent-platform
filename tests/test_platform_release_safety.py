@@ -3,10 +3,14 @@
 import hashlib
 import json
 import stat
+import tomllib
 import zipfile
+from fnmatch import fnmatchcase
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from setuptools import find_namespace_packages
 from setuptools.command.egg_info import FileList
 
 from infra.platform_migrations import PLATFORM_SCHEMA_REVISION
@@ -74,6 +78,9 @@ def test_release_check_rejects_business_packages(tmp_path, path):
     [
         "domain/secrets/provider_token.py",
         "domain/config/private_settings.py",
+        "capability_hub/nested/.claude/session.py",
+        "capability_hub/nested/.git-credentials",
+        "capability_hub/nested/client.crt",
         "../outside.py",
         r"domain\\secrets\\token.py",
     ],
@@ -120,14 +127,53 @@ def test_manifest_exclusion_patterns_reject_synthetic_private_paths():
         "infra/_schema_worker.py.zip",
         "framework/agent_runtime/pi/node/trace.har",
         "orchestration/.local/settings.py",
+        "capability_hub/remitter_search/secrets/token.py",
+        "capability_hub/remitter_search/config/deployment_policy.py",
+        "capability_hub/nested/deep/.claude/session.py",
+        "capability_hub/nested/.codex/deep/session.py",
+        "domain/nested/deep/config/settings.py",
+        "domain/nested/.cursor/session.py",
+        "interfaces/nested/.pi/session.py",
+        "infra/nested/.git-credentials",
+        "framework/nested/client.crt",
+        "framework/nested/identity.pub",
+        "orchestration/nested/workspace.iml",
     }
     file_list = FileList()
     file_list.files = sorted(safe | private)
     for raw_line in open("MANIFEST.in", encoding="utf-8"):
         line = raw_line.strip()
         if line and not line.startswith("#") and line.split(maxsplit=1)[0] in {
-            "prune", "exclude", "recursive-exclude",
+            "prune", "exclude", "recursive-exclude", "global-exclude",
         }:
             file_list.process_template_line(line)
     assert private.isdisjoint(file_list.files)
     assert safe.issubset(file_list.files)
+
+
+def test_docker_final_denials_cover_private_files_inside_allowed_source_roots():
+    lines = [line.strip() for line in Path("docker/platform/Dockerfile.dockerignore").read_text().splitlines()
+             if line.strip() and not line.startswith("#")]
+    final_denials = lines[max(index for index, line in enumerate(lines) if line.startswith("!")) + 1:]
+    for path in (
+        "capability_hub/nested/config/settings.py", "domain/nested/.claude/session.py",
+        "framework/nested/.codex/session.py", "infra/nested/.cursor/session.py",
+        "interfaces/nested/.pi/session.py", "orchestration/nested/.git-credentials",
+        "capability_hub/nested/client.crt", "capability_hub/nested/identity.pub",
+    ):
+        assert any(fnmatchcase(path, pattern) for pattern in final_denials), path
+    for package, assets in REQUIRED_ASSETS.items():
+        for asset in assets:
+            path = package.replace(".", "/") + "/" + asset
+            assert not any(fnmatchcase(path, pattern) for pattern in final_denials), path
+
+
+def test_package_discovery_excludes_nested_configuration(tmp_path):
+    for name in ("domain", "domain/config", "capability_hub", "capability_hub/config", "capability_hub/weather_query"):
+        package = tmp_path / name
+        package.mkdir(parents=True, exist_ok=True)
+        (package / "__init__.py").write_text("")
+    settings = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["setuptools"]["packages"]["find"]
+    packages = find_namespace_packages(where=str(tmp_path), include=settings["include"], exclude=settings["exclude"])
+    assert {"domain", "capability_hub", "capability_hub.weather_query"}.issubset(packages)
+    assert "domain.config" not in packages and "capability_hub.config" not in packages

@@ -10,6 +10,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from domain.capability import CapabilityDependency, CapabilityVersionRecord
+from domain.execution_requirements import (
+    WORKFLOW_CHECKPOINT_PROFILE,
+    WORKFLOW_INTERPRETER_PROFILE,
+    InstalledExecutionCapabilities,
+)
+from domain.task_worker import WorkerServices
 from domain.workflow_runtime import WorkflowAdapterDescriptor, WorkflowNodeRegistry
 from interfaces.http.routes.capabilities import router
 from orchestration.control_plane_auth import ControlPlanePrincipal
@@ -45,12 +51,17 @@ def test_adapter_installation_is_explicit_serial_and_read_only():
         WorkflowNodeRegistry([Tool(), Tool()])
 
 
-def test_worker_agent_role_must_match_standard_workflow_catalog():
-    workflow = WorkflowExecutor(SimpleNamespace(), {"agent": handler})
-    with pytest.raises(ValueError, match="role"):
-        PlatformWorker(SimpleNamespace(), "worker", {"workflow": workflow})
-    worker = PlatformWorker(SimpleNamespace(), "worker", {"workflow": workflow}, workflow_agents=True)
-    assert worker.workflow_agents
+def test_worker_manifest_must_match_installed_workflow_catalog():
+    workflow = WorkflowExecutor(SimpleNamespace(), SimpleNamespace(), {"agent": handler})
+    services = WorkerServices(queue=None, control=None, completion=None, authorization=None, validation=None)
+    with pytest.raises(ValueError, match="manifest"):
+        PlatformWorker(services, "worker", {"workflow": workflow})
+    capabilities = InstalledExecutionCapabilities.from_descriptors(
+        ("workflow",), workflow_interpreter_profile=WORKFLOW_INTERPRETER_PROFILE,
+        workflow_checkpoint_profile=WORKFLOW_CHECKPOINT_PROFILE, workflow_adapters=workflow.adapter_descriptors,
+    )
+    worker = PlatformWorker(services, "worker", {"workflow": workflow}, capabilities=capabilities)
+    assert worker.capabilities is capabilities
     with pytest.raises(TypeError):
         setitem(cast(Any, worker.executors), "agent", handler)
 

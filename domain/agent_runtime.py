@@ -93,6 +93,10 @@ class AgentRuntimeRegistry:
     def get(self, key: str) -> InstalledAgentRuntime | None:
         return self._runtimes.get(key)
 
+    @property
+    def descriptors(self) -> tuple[AgentRuntimeDescriptor, ...]:
+        return tuple(runtime.descriptor for runtime in self._runtimes.values())
+
     async def check_ready(self) -> None:
         for runtime in self._runtimes.values():
             await runtime.adapter.check_ready()

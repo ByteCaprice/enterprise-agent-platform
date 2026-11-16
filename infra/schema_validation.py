@@ -78,6 +78,16 @@ def validate_json(instance, schema, *, timeout_seconds: float = 3) -> None:
     _run(schema, instance, "validate", timeout_seconds)
 
 
+class IsolatedJSONValidator:
+    """Installed implementation of the execution plane's validation port."""
+
+    def validate(self, instance, schema) -> None:
+        validate_json(instance, schema)
+
+    def check_schema(self, schema) -> None:
+        check_json_schema(schema)
+
+
 def check_validation_backend() -> None:
     """Startup-only local handshake; never a Provider, model, Tool or DB call."""
     validate_json({}, {"type": "object", "maxProperties": 0})

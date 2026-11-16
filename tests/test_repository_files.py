@@ -35,6 +35,26 @@ def test_private_identity_and_assistant_files_are_excluded_from_all_distribution
         assert private_distribution_path(path), path
 
 
+def test_capability_hub_allows_public_code_but_not_private_resources():
+    public = (
+        "capability_hub/catalog.py", "capability_hub/remitter_search/workflow.py",
+        "capability_hub/weather_query/tools.py",
+    )
+    private = (
+        "capability_hub/private/settings.py", "capability_hub/config/settings.py", "capability_hub/weather_query/.env.local",
+        "capability_hub/remitter_search/customer.csv", "capability_hub/.claude/settings.json",
+        "capability_hub/deployment.key", "capability_hub/internal-notes.md",
+    )
+    assert not ignored_paths(public)
+    assert ignored_paths(private) == set(private)
+    for path in public:
+        assert not private_repository_path(path), path
+        assert not private_distribution_path(path), path
+    for path in private:
+        assert private_repository_path(path), path
+        assert private_distribution_path(path), path
+
+
 def test_repository_document_links_and_upload_candidates_are_clean():
     result = check()
     assert result["findings"] == [], result["findings"]

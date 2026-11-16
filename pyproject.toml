@@ -40,8 +40,8 @@ include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["domain*", "interfaces*", "orchestration*", "framework*", "infra*"]
-exclude = ["tests*", "config*", "docs*", "var*", "*.node_modules*", "**.private*", "**.secrets*", "**.credentials*"]
+include = ["domain*", "interfaces*", "orchestration*", "framework*", "infra*", "capability_hub*"]
+exclude = ["tests*", "config*", "docs*", "var*", "*.config*", "*.node_modules*", "**.private*", "**.secrets*", "**.credentials*"]
 
 [tool.setuptools.package-data]
 "framework.agent_runtime.pi" = ["node/*.mjs", "node/package.json", "node/package-lock.json"]
@@ -66,7 +66,7 @@ ignore = ["E501"]
 
 [tool.coverage.run]
 branch = true
-source = ["domain", "framework", "infra", "interfaces", "orchestration"]
+source = ["domain", "framework", "infra", "interfaces", "orchestration", "capability_hub"]
 
 [tool.coverage.report]
 show_missing = true

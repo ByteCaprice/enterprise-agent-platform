@@ -4,14 +4,9 @@ import json
 from string import Template
 
 from domain.capability import CapabilityError
+from domain.capability_definitions import validate_prompt_template as validate_template
 
-
-def validate_template(text: str, properties: dict) -> None:
-    template = Template(text)
-    if not template.is_valid():
-        raise CapabilityError("Prompt uses invalid template syntax; use ${variable}")
-    if set(template.get_identifiers()) - set(properties):
-        raise CapabilityError("Prompt variables must be declared in input_schema.properties")
+__all__ = ["render_template", "validate_template"]
 
 
 def render_template(text: str, variables: dict) -> str:

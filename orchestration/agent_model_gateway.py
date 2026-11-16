@@ -16,9 +16,11 @@ from domain.agent_turn import (
     strict_json,
 )
 from domain.capability import CapabilityDependency, CapabilityKind, SkillDefinition
+from domain.capability_definitions import interpret_definition
 from domain.execution_context import ExecutionDeadlineExceeded
+from domain.execution_ports import AgentTurnLedger, ExecutionResources
+from domain.outbound_operation import OutboundEvidence, evidence_from_exception
 from domain.platform_agent import (
-    AgentDefinition,
     AgentStepRecord,
     AgentStorageError,
     AgentToolIntent,
@@ -27,10 +29,16 @@ from domain.platform_agent import (
 from domain.platform_model import CredentialResolver, ModelTransportFailure
 from domain.schema_validation import JSONValidationUnavailable
 from domain.task import canonical_json
-from domain.task_execution import ExecutionFailure, TaskCancellationRequested, TaskLeaseLost
-from infra.schema_validation import validate_json
+from domain.task_execution import (
+    ExecutionFailure,
+    ExecutionResourceUnstoppable,
+    TaskCancellationRequested,
+    TaskLeaseLost,
+)
+from orchestration.execution_async import accounting_error, run_sync
 from orchestration.model_policy_resolver import ModelPolicyResolver
 from orchestration.platform_tool_gateway import PlatformToolGateway
+from orchestration.published_capabilities import PublishedCapabilities
 
 
 @dataclass(frozen=True)
@@ -48,10 +56,14 @@ class ResolvedAgentSkill:
     instructions: str = field(repr=False)
 
 
-class PlatformAgentModelGateway(ModelPolicyResolver):
-    def __init__(self, store, transport: AgentTurnTransport, credentials: CredentialResolver,
-                 tools: PlatformToolGateway):
-        super().__init__(store)
+class PlatformAgentModelGateway:
+    def __init__(self, resources: ExecutionResources, policies: ModelPolicyResolver, turns: AgentTurnLedger,
+                 transport: AgentTurnTransport, credentials: CredentialResolver, tools: PlatformToolGateway):
+        self.resources = resources
+        self.policies = policies
+        self.turns = turns
+        self.authorizer = resources.authorization
+        self.catalog = PublishedCapabilities(resources.capabilities)
         self.transport = transport
         self.credentials = credentials
         self.tools = tools
@@ -66,10 +78,10 @@ class PlatformAgentModelGateway(ModelPolicyResolver):
             elif (claim.task.capability_kind != "workflow" or
                   not self.authorizer.allowed_resource(claim, "agent:invoke", claim.reference.key)):
                 raise ExecutionFailure("AGENT_ACCESS_DENIED")
-            definition = AgentDefinition.model_validate(claim.artifact.definition)
+            definition = interpret_definition("agent", claim.artifact).materialize()
             policy_ref = CapabilityDependency(**definition.model_policy.model_dump())
             prompt_ref = CapabilityDependency(**definition.instruction_prompt.model_dump())
-            resolved = self.resolve_agent_policy(claim, policy_ref, prompt_ref)
+            resolved = self.policies.resolve_agent_policy(claim, policy_ref, prompt_ref)
             catalog = []
             for tool in definition.tools:
                 reference = CapabilityDependency(**tool.capability.model_dump())
@@ -92,26 +104,27 @@ class PlatformAgentModelGateway(ModelPolicyResolver):
         except Exception:
             raise ExecutionFailure("AGENT_CONFIGURATION_UNAVAILABLE") from None
 
-    async def _reject(self, claim, execution_id, step_id, code, *, reply=None, cancelled=False, http_status=None):
+    async def _reject(self, claim, execution_id, step_id, code, *, reply=None, cancelled=False, evidence=None):
+        evidence = reply.evidence if reply is not None else evidence or OutboundEvidence()
+        if evidence.response != "not_received":
+            evidence = evidence.with_acceptance(False)
         try:
-            await asyncio.to_thread(
-                self.store.agents.reject_call, claim.lease, execution_id, step_id, error_code=code, cancelled=cancelled,
-                actual_model=reply.actual_model if reply is not None else None,
-                usage=reply.usage if reply is not None else None,
-                http_status=reply.http_status if reply is not None else http_status,
-                request_id=reply.request_id if reply is not None else None,
+            await run_sync(
+                self.turns.reject_call, claim.lease, execution_id, step_id, error_code=code, cancelled=cancelled,
+                evidence=evidence,
+                _on_cancel_error=accounting_error("MODEL_ACCOUNTING_RESULT_UNKNOWN"),
             )
-        except (TaskLeaseLost, TaskCancellationRequested, ExecutionFailure):
+        except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable, ExecutionFailure):
             raise
         except Exception:
             raise ExecutionFailure("MODEL_ACCOUNTING_RESULT_UNKNOWN") from None
 
     async def generate_turn(self, claim, execution_id, conversation: AgentConversation) -> AcceptedAgentTurn:
-        definition, resolved, catalog, skills = await asyncio.to_thread(self.resolve_agent, claim)
+        definition, resolved, catalog, skills = await run_sync(self.resolve_agent, claim)
         payload = {**conversation.model_dump(mode="json"), "tools": [tool.model_dump(mode="json") for tool in catalog]}
         try:
             canonical_json(payload)
-            await asyncio.to_thread(validate_json, payload, resolved.artifact.input_schema)
+            await run_sync(self.resources.validation.validate, payload, resolved.artifact.input_schema)
         except JSONValidationUnavailable:
             raise ExecutionFailure("MODEL_VALIDATION_UNAVAILABLE") from None
         except Exception:
@@ -121,7 +134,7 @@ class PlatformAgentModelGateway(ModelPolicyResolver):
         except ExecutionDeadlineExceeded:
             raise ExecutionFailure("MODEL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
         try:
-            secret = await asyncio.to_thread(self.credentials.resolve, claim.task.project_key, resolved.provider.credential_ref)
+            secret = await run_sync(self.credentials.resolve, claim.task.project_key, resolved.provider.credential_ref)
         except ModelTransportFailure as exc:
             raise ExecutionFailure(exc.code) from None
         except Exception:
@@ -133,14 +146,16 @@ class PlatformAgentModelGateway(ModelPolicyResolver):
         except ExecutionDeadlineExceeded:
             raise ExecutionFailure("MODEL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
         try:
-            step, _ = await asyncio.to_thread(self.store.agents.start_turn, claim.lease, execution_id, input_hash=fingerprint)
-        except (TaskLeaseLost, TaskCancellationRequested, ExecutionFailure):
+            step, _ = await run_sync(self.turns.start_turn, claim.lease, execution_id, input_hash=fingerprint,
+                                     _on_cancel_error=accounting_error("MODEL_ACCOUNTING_RESULT_UNKNOWN"))
+        except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable, ExecutionFailure):
             raise
         except AgentStorageError:
             raise ExecutionFailure("AGENT_TURN_NOT_AVAILABLE") from None
         except Exception:
-            raise ExecutionFailure("MODEL_ACCOUNTING_UNAVAILABLE") from None
+            raise ExecutionFailure("MODEL_ACCOUNTING_RESULT_UNKNOWN") from None
         reply = None
+        settlement_started = False
         try:
             try:
                 timeout_seconds = claim.limit_timeout(resolved.policy.timeout_seconds)
@@ -166,14 +181,14 @@ class PlatformAgentModelGateway(ModelPolicyResolver):
                 raise TimeoutError
             if reply.error_code is not None:
                 raise ExecutionFailure(reply.error_code)
-            current_definition, current, current_catalog, current_skills = await asyncio.to_thread(self.resolve_agent, claim)
+            current_definition, current, current_catalog, current_skills = await run_sync(self.resolve_agent, claim)
             if (current.artifact.content_hash != resolved.artifact.content_hash or current_catalog != catalog or
                     current_definition != definition or current_skills != skills):
                 raise ExecutionFailure("MODEL_CONFIGURATION_CHANGED")
             assert reply.turn is not None
             turn = reply.turn
             try:
-                await asyncio.to_thread(validate_json, turn.model_dump(mode="json"),
+                await run_sync(self.resources.validation.validate, turn.model_dump(mode="json"),
                                         resolved.artifact.output_schema)
             except JSONValidationUnavailable:
                 raise ExecutionFailure("MODEL_VALIDATION_UNAVAILABLE") from None
@@ -185,7 +200,7 @@ class PlatformAgentModelGateway(ModelPolicyResolver):
                     raise ExecutionFailure("MODEL_OUTPUT_INVALID")
                 canonical_json(final_result)
                 try:
-                    await asyncio.to_thread(validate_json, final_result, claim.artifact.output_schema)
+                    await run_sync(self.resources.validation.validate, final_result, claim.artifact.output_schema)
                 except JSONValidationUnavailable:
                     raise ExecutionFailure("MODEL_VALIDATION_UNAVAILABLE") from None
             else:
@@ -200,29 +215,39 @@ class PlatformAgentModelGateway(ModelPolicyResolver):
             except ExecutionDeadlineExceeded:
                 raise ExecutionFailure("MODEL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
             try:
-                steps = await asyncio.to_thread(
-                    self.store.agents.accept_turn, claim.lease, execution_id, step.id,
+                settlement_started = True
+                steps = await run_sync(
+                    self.turns.accept_turn, claim.lease, execution_id, step.id,
                     output_hash=output_hash, actual_model=reply.actual_model, usage=reply.usage,
                     http_status=reply.http_status, request_id=reply.request_id, final_result=final_result, intents=intents,
+                    evidence=reply.evidence.with_acceptance(True),
+                    _on_cancel_error=accounting_error("MODEL_ACCOUNTING_RESULT_UNKNOWN"),
                 )
             except AgentValidationUnavailable:
                 raise ExecutionFailure("MODEL_VALIDATION_UNAVAILABLE") from None
             except AgentStorageError:
                 raise ExecutionFailure("MODEL_AGENT_TURN_REJECTED") from None
-            except (TaskLeaseLost, TaskCancellationRequested):
+            except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable, ExecutionFailure):
                 raise
             except Exception:
                 raise ExecutionFailure("MODEL_ACCOUNTING_RESULT_UNKNOWN") from None
         except TaskCancellationRequested:
+            if settlement_started:
+                raise
             await self._reject(claim, execution_id, step.id, "MODEL_CANCELLED_RESPONSE_DISCARDED",
                                reply=reply, cancelled=True)
             raise
-        except TaskLeaseLost:
+        except (TaskLeaseLost, ExecutionResourceUnstoppable):
             raise
-        except asyncio.CancelledError:
-            await self._reject(claim, execution_id, step.id, "MODEL_CANCELLED_RESULT_UNKNOWN", reply=reply, cancelled=True)
+        except asyncio.CancelledError as exc:
+            if settlement_started:
+                raise
+            await self._reject(claim, execution_id, step.id, "MODEL_CANCELLED_RESULT_UNKNOWN", reply=reply, cancelled=True,
+                               evidence=evidence_from_exception(exc))
             raise
         except (TimeoutError, ModelTransportFailure) as exc:
+            if settlement_started:
+                raise ExecutionFailure("MODEL_ACCOUNTING_RESULT_UNKNOWN") from None
             if isinstance(exc, TimeoutError):
                 try:
                     claim.limit_timeout(resolved.policy.timeout_seconds)
@@ -233,14 +258,18 @@ class PlatformAgentModelGateway(ModelPolicyResolver):
             else:
                 code = exc.code
             await self._reject(claim, execution_id, step.id, code, reply=reply,
-                               http_status=exc.http_status if isinstance(exc, ModelTransportFailure) else None)
+                               evidence=evidence_from_exception(exc))
             status = "timed_out" if code == "MODEL_EXECUTION_DEADLINE_EXCEEDED" else "failed"
             raise ExecutionFailure(code, status=status) from None
         except ExecutionFailure as exc:
+            if settlement_started or exc.code.endswith("ACCOUNTING_RESULT_UNKNOWN"):
+                raise
             code = exc.code if exc.code.startswith("MODEL_") else "MODEL_AGENT_ACCESS_DENIED"
             await self._reject(claim, execution_id, step.id, code, reply=reply)
             raise ExecutionFailure(code, status=exc.status) from None
         except Exception:
+            if settlement_started:
+                raise ExecutionFailure("MODEL_ACCOUNTING_RESULT_UNKNOWN") from None
             await self._reject(claim, execution_id, step.id, "MODEL_AGENT_TURN_INVALID", reply=reply)
             raise ExecutionFailure("MODEL_AGENT_TURN_INVALID") from None
         return AcceptedAgentTurn(reply, tuple(steps), final_result)

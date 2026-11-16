@@ -6,6 +6,9 @@
 |---|---|
 | 首次了解平台 | [项目 README](../README.md) → [功能与架构](overview.md) |
 | 业务接入开发者 | [API 使用](api.md)，从纯规则任务开始 |
+| 业务 Agent / Workflow 开发者 | [业务能力 Hub](capability-hub.md)，在同仓库编写和发布混合业务能力 |
+| 运行真实外部调用示例 | [Weather query demo](weather-query-demo.md)，验证多城市子流程、天气工具与模型解释 |
+| 配置 Agent 的 Skills / MCP | [Skills、MCP 与 Pi](agent-skills-mcp.md)，区分上下文指引、工具连接和实际执行 |
 | 独立前端开发者 | [前端接入契约](frontend-integration.md) → [API 使用](api.md)；先离线导出 OpenAPI |
 | 部署与运维人员 | [部署与运维](deployment.md)，先准备独立数据库与私有配置 |
 | 平台贡献者 | [贡献说明](../CONTRIBUTING.md) → [开发与仓库规范](development.md) |

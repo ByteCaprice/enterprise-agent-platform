@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from domain.execution_context import ExecutionDeadlineExceeded
+from domain.execution_requirements import ExecutionProfile, InstalledExecutionCapabilities
 from domain.schema_validation import JSONValidationUnavailable, ensure_self_contained_schema
 from domain.task import TaskValidationUnavailable, canonical_json
 from domain.task_control import ControlState, ExecutionObservation
@@ -26,8 +27,7 @@ from domain.task_execution import (
     TaskLeaseLost,
 )
 from domain.task_execution import ExecutionResourceUnstoppable as WorkerExecutionUnstoppable
-from infra.schema_validation import validate_json
-from orchestration.execution_authorization import ExecutionAuthorizer
+from domain.task_worker import WorkerServices
 
 Executor = Callable[[TaskClaim], Awaitable[dict]]
 
@@ -52,26 +52,56 @@ class WorkerPolicy:
 
 
 class PlatformWorker:
-    def __init__(self, store, worker_id: str, executors: Mapping[str, Executor], *, policy: WorkerPolicy | None = None,
-                 workflow_agents: bool = False):
+    def __init__(self, services: WorkerServices, worker_id: str, executors: Mapping[str, Executor], *, policy: WorkerPolicy | None = None,
+                 capabilities: InstalledExecutionCapabilities | None = None):
         if not isinstance(worker_id, str) or not worker_id.strip() or len(worker_id) > 200:
             raise ValueError("Invalid worker_id")
         if not executors or not set(executors) <= {"agent", "workflow"} or not all(callable(e) for e in executors.values()):
             raise ValueError("Install explicit Agent/Workflow execution adapters")
-        self.store = store
+        if not isinstance(capabilities, InstalledExecutionCapabilities) or capabilities.executor_kinds != frozenset(executors):
+            raise ValueError("Supply an explicit installed capability manifest matching the executor roles")
+        workflow = executors.get("workflow")
+        adapters = getattr(workflow, "adapter_descriptors", None)
+        if adapters is not None:
+            actual = frozenset(ExecutionProfile("workflow_adapter", item.kind, item.profile) for item in adapters)
+            advertised = frozenset(item for item in capabilities.profiles if item.component == "workflow_adapter")
+            if actual != advertised:
+                raise ValueError("Capability manifest does not match installed Workflow adapter descriptors")
+        agent = executors.get("agent")
+        runtimes = getattr(agent, "runtime_descriptors", None)
+        if runtimes is not None:
+            actual = frozenset(ExecutionProfile("agent_runtime", item.key, item.profile) for item in runtimes)
+            advertised = frozenset(item for item in capabilities.profiles if item.component == "agent_runtime")
+            if actual != advertised:
+                raise ValueError("Capability manifest does not match installed Agent runtime descriptors")
+        for kind, executor in executors.items():
+            for component, attribute in (("interpreter", "interpreter_profile"), ("checkpoint", "checkpoint_profile")):
+                profile = getattr(executor, attribute, None)
+                if profile is not None and ExecutionProfile(component, kind, profile) not in capabilities.profiles:
+                    raise ValueError("Capability manifest does not match installed executor profiles")
+        extra = frozenset(profile for executor in executors.values()
+                          for profile in getattr(executor, "additional_profiles", ()))
+        advertised_extra = frozenset(profile for profile in capabilities.profiles if profile.key == "workflow_code")
+        if extra != advertised_extra:
+            raise ValueError("Capability manifest does not match installed code Workflow semantics")
+        implementations = frozenset(reference for executor in executors.values()
+                                    for reference in getattr(executor, "implementation_references", ()))
+        if implementations != capabilities.implementations:
+            raise ValueError("Capability manifest does not match installed business implementations")
+        for role in ("workflow", "tool"):
+            actual = frozenset(reference for executor in executors.values()
+                               for reference in getattr(executor, role + "_implementation_references", ()))
+            if actual != getattr(capabilities, role + "_implementations"):
+                raise ValueError("Capability manifest does not match installed business implementation roles")
         self.worker_id = worker_id
         self.executors = MappingProxyType(dict(executors))
         self.policy = policy or WorkerPolicy()
-        if type(workflow_agents) is not bool or (workflow_agents and "workflow" not in executors):
-            raise ValueError("Declare Workflow Agent support on a Workflow Worker")
-        node_kinds = getattr(self.executors.get("workflow"), "node_kinds", None)
-        if node_kinds is not None and (
-            not isinstance(node_kinds, frozenset) or not node_kinds <= {"rule", "llm", "tool", "agent"} or
-            ("agent" in node_kinds) != workflow_agents
-        ):
-            raise ValueError("Workflow Agent role must match the installed node adapter catalog")
-        self.workflow_agents = workflow_agents
-        self.authorizer = ExecutionAuthorizer(store)
+        self.capabilities = capabilities
+        self.queue = services.queue
+        self.control = services.control
+        self.completion = services.completion
+        self.authorizer = services.authorization
+        self.validation = services.validation
         self._busy = False
         self._poisoned = False
 
@@ -110,7 +140,7 @@ class PlatformWorker:
             ensure_self_contained_schema(schema)
         canonical_json(claim.input)
         try:
-            await asyncio.to_thread(validate_json, claim.input, artifact.input_schema)
+            await asyncio.to_thread(self.validation.validate, claim.input, artifact.input_schema)
         except JSONValidationUnavailable:
             raise ExecutionFailure("TASK_VALIDATION_UNAVAILABLE") from None
         # Never import an executable target supplied in a capability definition.
@@ -120,7 +150,7 @@ class PlatformWorker:
             raise ValueError("Execution output must be a JSON object")
         canonical_json(result)
         try:
-            await asyncio.to_thread(validate_json, result, artifact.output_schema)
+            await asyncio.to_thread(self.validation.validate, result, artifact.output_schema)
         except JSONValidationUnavailable:
             raise ExecutionFailure("TASK_VALIDATION_UNAVAILABLE") from None
         self._require_budget(claim)
@@ -128,7 +158,7 @@ class PlatformWorker:
 
     async def _control(self, claim):
         return await asyncio.wait_for(asyncio.to_thread(
-            self.store.task_control.observe, claim.lease, lease_seconds=self.policy.lease_seconds,
+            self.control.observe, claim.lease, lease_seconds=self.policy.lease_seconds,
             cancellation_grace_seconds=self.policy.cancellation_grace_seconds,
         ), timeout=self.policy.lease_seconds / 3)
 
@@ -175,13 +205,13 @@ class PlatformWorker:
                 # Never acknowledge an unreaped runtime. Failure to record this
                 # classification leaves the durable intent for expiry recovery.
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(asyncio.to_thread(self.store.task_control.abandon_cancel, claim.lease),
+                    await asyncio.wait_for(asyncio.to_thread(self.control.abandon_cancel, claim.lease),
                                            self.policy.lease_seconds / 3)
                 raise
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
-        await asyncio.wait_for(asyncio.to_thread(self.store.task_control.acknowledge_cancel, claim.lease),
+        await asyncio.wait_for(asyncio.to_thread(self.control.acknowledge_cancel, claim.lease),
                                self.policy.lease_seconds / 3)
 
     async def _cancel(self, claim, execution):
@@ -200,7 +230,7 @@ class PlatformWorker:
 
     async def _finalize(self, claim, execution, *, status, result=None, error_code=None):
         try:
-            outcome = await asyncio.to_thread(self.store.tasks.complete, claim.lease,
+            outcome = await asyncio.to_thread(self.completion.complete, claim.lease,
                                               status=status, result=result, error_code=error_code)
         except TaskValidationUnavailable:
             if status != "succeeded":
@@ -208,7 +238,7 @@ class PlatformWorker:
             # This typed failure is raised before the terminal write and the
             # repository transaction has rolled back. Do not repeat execution or
             # retry an uncertain write: settle failure under the SAME live fence.
-            outcome = await asyncio.to_thread(self.store.tasks.complete, claim.lease,
+            outcome = await asyncio.to_thread(self.completion.complete, claim.lease,
                 status="failed", error_code="TASK_VALIDATION_UNAVAILABLE")
         if outcome == CompletionOutcome.CANCELLATION_PENDING:
             await self._cancel(claim, execution)
@@ -229,13 +259,12 @@ class PlatformWorker:
         self._busy = True
         execution = monitor = None
         try:
-            rejected = await asyncio.to_thread(self.store.tasks.reject_disabled_project_tasks)
-            await asyncio.to_thread(self.store.tasks.recover_expired)
+            rejected = await asyncio.to_thread(self.queue.reject_disabled_project_tasks)
+            await asyncio.to_thread(self.queue.recover_expired)
             if rejected:
                 return True
-            claim = await asyncio.to_thread(self.store.tasks.claim, self.worker_id,
-                                           lease_seconds=self.policy.lease_seconds, kinds=tuple(self.executors),
-                                           workflow_agents=self.workflow_agents)
+            claim = await asyncio.to_thread(self.queue.claim, self.worker_id,
+                                           lease_seconds=self.policy.lease_seconds, capabilities=self.capabilities)
             if claim is None:
                 return False
             observation = await self._renew(claim)

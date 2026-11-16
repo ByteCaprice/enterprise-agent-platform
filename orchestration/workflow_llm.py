@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
-import asyncio
-
+from domain.execution_authorization import ExecutionAuthorizationPort
+from domain.execution_ports import ExecutionPrompts
 from domain.platform_model import ModelMessage, ModelMessages
 from domain.task_execution import ExecutionFailure, TaskClaim
 from domain.workflow import WorkflowNode
 from domain.workflow_runtime import WorkflowAdapterDescriptor
-from orchestration.execution_authorization import ExecutionAuthorizer
+from orchestration.execution_async import run_sync
 from orchestration.platform_model_gateway import PlatformModelGateway
-from orchestration.prompt_renderer import PromptRenderer
 
 
 class WorkflowLLM:
     descriptor = WorkflowAdapterDescriptor(kind="llm", profile="enterprise-ai.workflow.llm.v1")
 
-    def __init__(self, store, gateway: PlatformModelGateway):
+    def __init__(self, gateway: PlatformModelGateway, prompts: ExecutionPrompts,
+                 authorization: ExecutionAuthorizationPort):
         self.gateway = gateway
-        self.prompts = PromptRenderer(store.capabilities)
-        self.authorizer = ExecutionAuthorizer(store)
+        self.prompts = prompts
+        self.authorizer = authorization
 
     def _messages(self, claim: TaskClaim, node: WorkflowNode, values: dict) -> ModelMessages:
         if node.prompt is None:
@@ -39,5 +39,5 @@ class WorkflowLLM:
     async def __call__(self, claim: TaskClaim, node: WorkflowNode, values: dict, node_id: str) -> dict:
         if node.kind != "llm" or node.capability is None:
             raise ExecutionFailure("MODEL_CONFIGURATION_UNAVAILABLE")
-        messages = await asyncio.to_thread(self._messages, claim, node, values)
+        messages = await run_sync(self._messages, claim, node, values)
         return await self.gateway.complete(claim, node_id, node.capability, messages, prompt=node.prompt)

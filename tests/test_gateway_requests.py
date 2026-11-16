@@ -28,31 +28,34 @@ def test_admission_atomic_and_reuse(monkeypatch):
     committed = []
 
     @contextmanager
-    def uow():
+    def uow(project, owner):
         pending = []
-        yield pending
+        def admit(prepared):
+            pending.append("task")
+            return TASK, not committed
+
+        def record_gateway(command):
+            return create(command, pending)
+
+        yield SimpleNamespace(admit=admit, record_gateway=record_gateway)
         committed.extend(pending)
 
-    def create(command, *, conn):
+    def create(command, conn):
         assert conn and conn[0] == "task"
         if command.correlation_id == "fail":
             raise RuntimeError("evidence failed")
         conn.append(command)
         return GatewayRequestRecord(**command.model_dump(), create_time=NOW)
 
-    store = SimpleNamespace(unit_of_work=uow, gateway_requests=SimpleNamespace(create=create))
+    store = SimpleNamespace(admission=SimpleNamespace(unit_of_work=uow))
     service = GatewayService(store, None)
-
-    def submit(*args, conn, **kwargs):
-        conn.append("task")
-        return TASK, not committed
-
-    monkeypatch.setattr(service.tasks, "submit", submit)
+    principal = SimpleNamespace(identity_id="identity")
+    monkeypatch.setattr(service.tasks, "prepare", lambda *args: object())
     with pytest.raises(RuntimeError, match="evidence failed"):
-        service.submit(None, "payments", SPEC, "key", context=GatewayRequestContext(correlation_id="fail"))
+        service.submit(principal, "payments", SPEC, "key", context=GatewayRequestContext(correlation_id="fail"))
     assert committed == []
-    first = service.submit(None, "payments", SPEC, "key", context=GatewayRequestContext(correlation_id="one"))
-    second = service.submit(None, "payments", SPEC, "key", context=GatewayRequestContext(correlation_id="two"),
+    first = service.submit(principal, "payments", SPEC, "key", context=GatewayRequestContext(correlation_id="one"))
+    second = service.submit(principal, "payments", SPEC, "key", context=GatewayRequestContext(correlation_id="two"),
                             operation="execute", delivery_mode="sync")
     assert first.task == second.task == TASK
     assert first.request.id != second.request.id
@@ -60,12 +63,8 @@ def test_admission_atomic_and_reuse(monkeypatch):
     assert (first.request.correlation_id, second.request.correlation_id) == ("one", "two")
     assert (first.request.delivery_mode, second.request.delivery_mode) == ("async", "sync")
     assert len(committed) == 4
-    def recover(*args, conn):
-        conn.append("task")
-        return TASK, False
-
-    monkeypatch.setattr(service.tasks, "recover", recover)
-    recovered = service.recover(None, "payments", "source", "key", context=GatewayRequestContext())
+    monkeypatch.setattr(service.tasks, "prepare_recovery", lambda *args: object())
+    recovered = service.recover(principal, "payments", "source", "key", context=GatewayRequestContext())
     assert recovered.request.operation == "recover"
     assert recovered.request.task_created is False
 
@@ -94,7 +93,7 @@ def test_http_generated_identity_and_sync_wait(monkeypatch):
     app.dependency_overrides[authenticated_principal] = lambda: object()
 
     class FakeGateway:
-        def __init__(self, store, auth):
+        def __init__(self, store, auth, *, validator):
             pass
 
         def submit(self, principal, project, spec, key, *, context, operation, delivery_mode):

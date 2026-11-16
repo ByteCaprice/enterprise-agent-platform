@@ -14,6 +14,7 @@ from domain.capability import CapabilitySpec, CapabilityVersionDraft
 from domain.platform_agent import AgentDefinition, AgentStorageConflict, AgentToolIntent
 from domain.platform_model import ModelUsage
 from domain.task_execution import TaskLeaseLost
+from infra.schema_validation import IsolatedJSONValidator
 from orchestration.capability_service import CapabilityService
 
 inbox = inbox_fixture
@@ -24,7 +25,7 @@ RESULT = {"name": "Synthetic name"}
 def root_fixture(client, store, monkeypatch, *, begin=True, headers=None, claim_task=True, skill=None):
     setup_tool(client, store)
     setup_model(client, store, monkeypatch, prompt=False)
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     service.create("payments", CapabilitySpec(key="instructions", kind="prompt", name="Instructions"), "task-admin")
     service.create_draft("payments", "instructions", CapabilityVersionDraft(
         version="1", definition={"template": "Synthetic review instructions"},
@@ -60,7 +61,9 @@ def root_fixture(client, store, monkeypatch, *, begin=True, headers=None, claim_
     assert response.status_code == 202
     if not claim_task:
         return None, None, response.headers["Location"]
-    claim = store.tasks.claim("agent-storage", kinds=("agent",), lease_seconds=60)
+    from worker_support import worker_capabilities
+
+    claim = store.task_queue.claim("agent-storage", capabilities=worker_capabilities("agent"), lease_seconds=60)
     execution = store.agents.begin(claim.lease, runtime_profile="enterprise-ai.pi.v1") if begin else None
     return claim, execution, response.headers["Location"]
 
@@ -95,9 +98,9 @@ def test_atomic_model_intents_tool_evidence_and_final_task_without_fake_workflow
     store.agents.accept_turn(claim.lease, execution.id, final.id, output_hash="d" * 64,
                              actual_model="catalog/primary", final_result=RESULT)
     with pytest.raises(ValueError, match="unfinished Agent"):
-        store.tasks.complete(claim.lease, status="succeeded", result=RESULT)
+        store.task_completion.complete(claim.lease, status="succeeded", result=RESULT)
     store.agents.finish(claim.lease, execution.id, result=RESULT)
-    assert store.tasks.complete(claim.lease, status="succeeded", result=RESULT)
+    assert store.task_completion.complete(claim.lease, status="succeeded", result=RESULT)
     assert client.get(target + "/result", headers=ADMIN).json()["result"] == RESULT
     calls = client.get(target + "/tool-calls", headers=ADMIN)
     assert calls.json()[0]["owner"] == {"kind": "agent_step", "agent_execution_id": execution.id, "step_id": tool.id}
@@ -123,7 +126,7 @@ def test_expiry_distinguishes_unstarted_intents_from_running_calls_and_fences_la
         connection.execute(text("UPDATE ai_task_attempt SET lease_expires_at=start_time WHERE id=:id"), {"id": claim.lease.attempt_id})
     with pytest.raises(TaskLeaseLost):
         store.agents.finish_tool(claim.lease, execution.id, tool.id, output=RESULT)
-    assert store.tasks.recover_expired() == 1
+    assert store.task_queue.recover_expired() == 1
     with store.engine.connect() as connection:
         rows = connection.execute(text("SELECT status,error_code FROM ai_agent_step WHERE kind='tool_call' ORDER BY slot")).all()
         assert rows[0].status == "failed" and rows[0].error_code.endswith("RESULT_UNKNOWN")

@@ -12,6 +12,7 @@ from infra.store.model import AiTask, AiTaskAttempt
 from infra.store.repository.base import BaseRepository
 from infra.store.repository.execution import ExecutionWriteMode, active_execution
 from infra.store.repository.execution_convergence import converge_execution_evidence
+from infra.store.repository.execution_effects import record_task_transition
 from infra.store.repository.task import TaskRepository
 
 
@@ -68,9 +69,9 @@ class TaskControlRepository(BaseRepository):
                 was_queued = task.status == "queued"
                 if was_queued:
                     task.status, task.finish_time = "cancelled", task.cancel_requested_at
-                TaskRepository._audit(session, task, actor, "task_cancel_requested")
+                record_task_transition(session, task, actor, "task_cancel_requested")
                 if was_queued:
-                    TaskRepository._audit(session, task, actor, "task_cancelled")
+                    record_task_transition(session, task, actor, "task_cancelled")
             session.flush()
             return self._receipt(session, task, capability)
 
@@ -107,7 +108,7 @@ class TaskControlRepository(BaseRepository):
             if updated is None:
                 return ExecutionObservation(ControlState.LEASE_LOST)
             if first:
-                TaskRepository._audit(session, task, lease.worker_id, "task_cancel_observed")
+                record_task_transition(session, task, lease.worker_id, "task_cancel_observed")
             return ExecutionObservation(ControlState.CANCELLATION_REQUESTED if cancelling else ControlState.ACTIVE,
                                         task.cancel_request_id)
 
@@ -144,11 +145,11 @@ class TaskControlRepository(BaseRepository):
             if updated is None:
                 return False
             if attempt.cancel_observed_at is None:
-                TaskRepository._audit(session, task, lease.worker_id, "task_cancel_observed")
+                record_task_transition(session, task, lease.worker_id, "task_cancel_observed")
             converge_execution_evidence(session, task.id, attempt.id, now,
                                         "CANCELLED" if confirmed else "CANCEL_CLEANUP", cancelled=confirmed)
             task.status, task.finish_time, task.error_code = status, now, error
-            TaskRepository._audit(session, task, lease.worker_id,
+            record_task_transition(session, task, lease.worker_id,
                                   "task_cancelled" if confirmed else "task_cancel_unconfirmed")
             session.flush()
             return True

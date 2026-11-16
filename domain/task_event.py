@@ -5,6 +5,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+TERMINAL_TASK_EVENTS = frozenset({
+    "task_succeeded", "task_failed", "task_timed_out", "task_cancelled",
+    "task_lease_expired", "task_cancel_unconfirmed",
+})
+
 
 class TaskEventRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)

@@ -14,6 +14,7 @@ from test_platform_tasks import inbox as inbox_fixture
 from domain.capability import CapabilitySpec, CapabilityVersionDraft
 from domain.platform_model import ModelTransportResponse
 from infra.model_credentials import credential_variable_name
+from infra.schema_validation import IsolatedJSONValidator
 from interfaces.worker.callbacks import run_callback_worker
 from interfaces.worker.platform import run_workflow_worker
 from orchestration.capability_service import CapabilityService
@@ -30,7 +31,7 @@ def checked(response, status=200):
 def test_operations_quality_memory_callback_recovery_and_oidc(inbox, monkeypatch):
     client, store = inbox
     assert not any(path.startswith("/v1/") for path in client.app.openapi()["paths"])
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     service.create("payments", CapabilitySpec(key="pure", kind="workflow", name="Pure"), "task-admin")
     service.create_draft("payments", "pure", CapabilityVersionDraft(version="1", definition={
         "max_parallel_rules": 2,

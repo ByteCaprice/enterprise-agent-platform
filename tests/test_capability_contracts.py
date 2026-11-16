@@ -16,8 +16,9 @@ from domain.capability import (
     CapabilityVersionDraft,
     CapabilityVersionRecord,
 )
+from domain.capability_definitions import interpret_definition
 from framework.prompts import render_template
-from orchestration.capability_service import CapabilityService
+from orchestration.capability_validation import require_local_schema
 from orchestration.prompt_renderer import PromptRenderer
 from orchestration.published_capabilities import PublishedCapabilities
 
@@ -25,7 +26,7 @@ from orchestration.published_capabilities import PublishedCapabilities
 @pytest.mark.parametrize("keyword", ["$ref", "$dynamicRef", "$recursiveRef"])
 def test_all_schema_reference_forms_refuse_external_fetch(keyword):
     with pytest.raises(CapabilityError, match="local references"):
-        CapabilityService._local_schema_only({"$defs": {"nested": {keyword: "https://untrusted.test/schema"}}})
+        require_local_schema({"$defs": {"nested": {keyword: "https://untrusted.test/schema"}}})
 
 
 def test_artifact_fingerprint_excludes_publication_metadata_and_rejects_nul():
@@ -44,7 +45,7 @@ def test_artifact_fingerprint_excludes_publication_metadata_and_rejects_nul():
 
 
 def test_local_schema_references_are_allowed():
-    CapabilityService._local_schema_only({"$defs": {"value": {"type": "string"}}, "$ref": "#/$defs/value"})
+    require_local_schema({"$defs": {"value": {"type": "string"}}, "$ref": "#/$defs/value"})
 
 
 @pytest.mark.parametrize("nodes", [
@@ -58,7 +59,7 @@ def test_workflow_contract_rejects_cycles_missing_nodes_and_duplicate_keys(nodes
     ]}
     draft = CapabilityVersionDraft(version="1", definition=definition, dependencies=[{"key": "lookup", "version": "1"}])
     with pytest.raises(CapabilityError, match="cycle|dependency|unique"):
-        CapabilityService._validate_definition(CapabilityKind.WORKFLOW, draft)
+        interpret_definition(CapabilityKind.WORKFLOW, draft)
 
 
 def test_workflow_cannot_implicitly_resolve_an_unpinned_node_capability():
@@ -66,7 +67,7 @@ def test_workflow_cannot_implicitly_resolve_an_unpinned_node_capability():
         {"key": "lookup", "kind": "tool", "capability": {"key": "lookup", "version": "1"}},
     ]})
     with pytest.raises(CapabilityError, match="pinned"):
-        CapabilityService._validate_definition(CapabilityKind.WORKFLOW, draft)
+        interpret_definition(CapabilityKind.WORKFLOW, draft)
 
 
 def published_prompt():

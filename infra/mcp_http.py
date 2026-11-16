@@ -25,12 +25,14 @@ _SESSION_ID = re.compile(r"^[\x21-\x7e]{1,256}$")
 
 
 class MCPJSONSession:
-    def __init__(self, client, url, hostname, original_host, secret, protocol_version):
+    def __init__(self, client, url, hostname, original_host, secret: str | None, protocol_version):
         self._client = client
         self._url = url
-        self._headers = {"Authorization": f"Bearer {secret}", "Host": original_host,
-                         "Accept": "application/json, text/event-stream", "Accept-Encoding": "identity",
-                         "Content-Type": "application/json"}
+        self._headers = {"Host": original_host,
+                          "Accept": "application/json, text/event-stream", "Accept-Encoding": "identity",
+                          "Content-Type": "application/json"}
+        if secret is not None:
+            self._headers["Authorization"] = f"Bearer {secret}"
         self._hostname = hostname
         self._protocol_version = protocol_version
         self._session_id = None
@@ -183,10 +185,12 @@ class MCPJSONTransport:
 
     @asynccontextmanager
     async def open(self, connection: MCPConnection):
-        try:
-            secret = self._credentials.resolve(connection.project_key, connection.credential_ref)
-        except Exception:
-            raise ExecutionFailure("TOOL_MCP_CREDENTIAL_UNAVAILABLE") from None
+        secret = None
+        if connection.credential_ref is not None:
+            try:
+                secret = self._credentials.resolve(connection.project_key, connection.credential_ref).value
+            except Exception:
+                raise ExecutionFailure("TOOL_MCP_CREDENTIAL_UNAVAILABLE") from None
         try:
             hostname = urlsplit(connection.endpoint).hostname
             if hostname is None:
@@ -199,7 +203,7 @@ class MCPJSONTransport:
             async with self._client_factory(trust_env=False, follow_redirects=False, verify=True,
                                             timeout=httpx.Timeout(10, connect=5)) as client:
                 session = MCPJSONSession(client, url, hostname, original.netloc.decode("ascii"),
-                                         secret.value, connection.protocol_version)
+                                         secret, connection.protocol_version)
                 failed = False
                 try:
                     yield session

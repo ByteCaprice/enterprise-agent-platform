@@ -21,6 +21,7 @@ from domain import ApiKeyConfig, utc_now
 from domain.capability import CapabilitySpec, CapabilityVersionDraft
 from domain.governance import AccessKeyCreate, ProjectCreate, ResourceGrantCreate, ServiceIdentityCreate
 from infra.platform_store import PlatformStore
+from infra.schema_validation import IsolatedJSONValidator
 from infra.store.model import AiServiceAccessKey
 from interfaces.http.platform_server import create_platform_app
 from orchestration.capability_service import CapabilityService
@@ -34,7 +35,7 @@ ADMIN = {"x-api-key": ADMIN_TOKEN}
 
 @pytest.fixture
 def platform(monkeypatch, pg_url):
-    from interfaces.http import platform_server
+    from interfaces import runtime
 
     url = fresh_database_url(pg_url)
     engine = create_engine(url)
@@ -50,8 +51,8 @@ def platform(monkeypatch, pg_url):
     ))
     store.governance.create_project(ProjectCreate(key="payments", name="Payments"), "test-admin")
     store.governance.create_project(ProjectCreate(key="other", name="Other"), "test-admin")
-    monkeypatch.setattr(platform_server, "load_settings", lambda _path: {"database": {"schema": schema}})
-    monkeypatch.setattr(platform_server, "build_engine", lambda _settings: create_engine(url))
+    monkeypatch.setattr(runtime, "load_settings", lambda _path: {"database": {"schema": schema}})
+    monkeypatch.setattr(runtime, "build_engine", lambda _settings: create_engine(url))
     try:
         with TestClient(create_platform_app("unused")) as client:
             client.app.state.rate_limiter.settings["enabled"] = False
@@ -83,7 +84,7 @@ def grant(client, identity_id, action, resource="*", project="payments"):
 
 
 def prompt(store, key="review", project="payments"):
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     service.create(project, CapabilitySpec(key=key, kind="prompt", name=key), "test-admin")
     service.create_draft(project, key, CapabilityVersionDraft(
         version="1", definition={"template": "Synthetic published prompt"},

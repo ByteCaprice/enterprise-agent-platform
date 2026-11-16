@@ -23,6 +23,7 @@ from domain.task import TaskRecord, TaskStatus
 from domain.task_control import ControlState, ExecutionObservation
 from domain.task_execution import CompletionOutcome, ExecutionFailure, TaskClaim, TaskLease
 from domain.workflow import WorkflowCheckpoint, WorkflowNodeRecord
+from domain.workflow_invocation import WorkflowInvocation
 from orchestration.agent_broker import AgentBroker
 from orchestration.agent_model_gateway import PlatformAgentModelGateway
 from orchestration.execution_authorization import ExecutionAuthorizer
@@ -31,11 +32,12 @@ from orchestration.platform_worker import PlatformWorker
 from orchestration.workflow_executor import WorkflowExecutor
 
 
-def claim_for(definition=None, owner="admin:ops"):
+def claim_for(definition=None, owner="admin:ops", *, dependencies=()):
     now = datetime.now(UTC)
     artifact = CapabilityVersionRecord(
         id="artifact", capability_id="capability", version="1", status="published", content_hash="0" * 64,
         definition=definition or {"nodes": [{"key": "echo", "kind": "rule", "rule": {"operation": "project"}}]},
+        dependencies=list(dependencies),
         created_by="ops", create_time=now, published_by="ops", publish_time=now,
     )
     artifact.content_hash = artifact.fingerprint()
@@ -87,7 +89,7 @@ def test_authorization_uses_live_root_identity_not_agent_identity():
     store = SimpleNamespace(governance=SimpleNamespace(get_project=lambda _: active, execution_resources=resources))
     root = claim_for(owner="service:business")
     agent = AgentInvocation(root, CapabilityDependency(key="agent", version="1"), root.artifact, {}, "node")
-    authorizer = ExecutionAuthorizer(store)
+    authorizer = ExecutionAuthorizer(store.governance, SimpleNamespace(get=lambda _: None))
     assert authorizer.allowed(agent)
     assert queries[-1] == ("demo", "business", "task:submit")
     assert not authorizer.allowed_resource(agent, "agent:invoke", "agent")
@@ -108,7 +110,7 @@ def test_administrator_lookup_is_targeted_and_revocation_is_live():
 
     store = SimpleNamespace(governance=SimpleNamespace(get_project=lambda _: {"enabled": True}),
                             api_key_configs=SimpleNamespace(get=get_key))
-    authorizer = ExecutionAuthorizer(store)
+    authorizer = ExecutionAuthorizer(store.governance, store.api_key_configs)
     claim = claim_for()
     assert authorizer.allowed(claim)
     key.enabled = False
@@ -116,15 +118,65 @@ def test_administrator_lookup_is_targeted_and_revocation_is_live():
     assert names == ["ops", "ops"]
 
 
+def test_subworkflow_and_embedded_agent_recheck_the_entire_delegation_chain():
+    root = claim_for(owner="service:business").with_timeout(20)
+    first = WorkflowInvocation.from_root(root).child(
+        CapabilityDependency(key="subflow", version="1"), root.artifact, {}, "workflow-call",
+    ).with_timeout(5)
+    second = first.child(CapabilityDependency(key="nested", version="2"), root.artifact, {}, "nested-call")
+    agent = AgentInvocation(second, CapabilityDependency(key="agent", version="1"), root.artifact, {}, "agent-call")
+    grants = {"task:submit": {"flow"}, "workflow:invoke": {"subflow", "nested"}}
+    governance = SimpleNamespace(
+        get_project=lambda _: {"enabled": True},
+        execution_resources=lambda _project, _identity, action: grants.get(action, set()),
+    )
+    authorizer = ExecutionAuthorizer(governance, SimpleNamespace(get=lambda _: None))
+    assert authorizer.allowed(second) and authorizer.allowed(agent)
+    assert agent.task is root.task and agent.lease is root.lease
+    assert agent.budget.deadline == first.budget.deadline
+    grants["workflow:invoke"].remove("subflow")
+    assert not authorizer.allowed(second) and not authorizer.allowed(agent)
+    assert authorizer.allowed(WorkflowInvocation.from_root(root))
+
+
+def test_agent_failure_settlement_never_retries_an_uncertain_terminal_write():
+    settled = []
+    root = claim_for()
+    broker = AgentBroker(
+        AgentInvocation(root, CapabilityDependency(key="agent", version="1"), root.artifact, {}),
+        SimpleNamespace(), AgentRuntimeDescriptor(key="pi", profile="enterprise-ai.pi.v1"),
+        lifecycle=SimpleNamespace(fail=lambda *args, **kwargs: settled.append((args, kwargs))),
+        prompts=SimpleNamespace(),
+    )
+    broker._execution_id = "execution"
+
+    async def run():
+        await broker.fail("MODEL_UPSTREAM_UNAVAILABLE")
+        with pytest.raises(ExecutionFailure, match="AGENT_ACCOUNTING_RESULT_UNKNOWN"):
+            await broker.fail("MODEL_UPSTREAM_UNAVAILABLE")
+
+    asyncio.run(run())
+    assert settled == [((root.lease, "execution"), {"error_code": "MODEL_UPSTREAM_UNAVAILABLE"})]
+
+
 def test_worker_workflow_adapter_receives_narrowed_budget_without_new_task():
+    from worker_support import worker_services
+
+    from domain.execution_requirements import (
+        WORKFLOW_CHECKPOINT_PROFILE,
+        WORKFLOW_INTERPRETER_PROFILE,
+        InstalledExecutionCapabilities,
+    )
+
     claim = claim_for({"nodes": [{
         "key": "model", "kind": "llm", "capability": {"key": "policy", "version": "1"},
         "timeout_seconds": 2,
-    }], "output_mapping": {"ok": {"source": "node", "node": "model", "pointer": "/ok"}}})
+    }], "output_mapping": {"ok": {"source": "node", "node": "model", "pointer": "/ok"}}},
+        dependencies=[{"key": "policy", "version": "1"}])
     finished = []
     observed = []
 
-    def begin(lease, node_key, input_hash):
+    def begin(lease, node_key, input_hash, *, interpreter_profile, checkpoint_profile):
         assert lease is claim.lease
         return WorkflowCheckpoint(WorkflowNodeRecord(
             id="node", task_id=claim.task.id, task_attempt_id=lease.attempt_id, node_key=node_key,
@@ -138,8 +190,9 @@ def test_worker_workflow_adapter_receives_narrowed_budget_without_new_task():
         governance=SimpleNamespace(get_project=lambda _: {"enabled": True}),
         api_key_configs=SimpleNamespace(get=lambda _: SimpleNamespace(enabled=True, scopes=["admin"])),
         workflows=SimpleNamespace(begin=begin, finish=lambda *_args, **_kwargs: True),
-        tasks=SimpleNamespace(reject_disabled_project_tasks=lambda: 0, recover_expired=lambda: 0,
-                              claim=lambda *_args, **_kwargs: claim, complete=complete),
+        task_queue=SimpleNamespace(reject_disabled_project_tasks=lambda: 0, recover_expired=lambda: 0,
+                              claim=lambda *_args, **_kwargs: claim),
+        task_completion=SimpleNamespace(complete=complete),
         task_control=SimpleNamespace(observe=lambda *_args, **_kwargs: ExecutionObservation(ControlState.ACTIVE)),
     )
 
@@ -148,7 +201,16 @@ def test_worker_workflow_adapter_receives_narrowed_budget_without_new_task():
         observed.append(node_claim.limit_timeout(60))
         return {"ok": True}
 
-    worker = PlatformWorker(store, "worker", {"workflow": WorkflowExecutor(store, {"llm": adapter})})
+    from domain.workflow_runtime import WorkflowAdapterDescriptor
+
+    adapter.descriptor = WorkflowAdapterDescriptor(kind="llm", profile="enterprise-ai.workflow.llm.v1")
+    authorization = ExecutionAuthorizer(store.governance, store.api_key_configs)
+    executor = WorkflowExecutor(store.workflows, authorization, {"llm": adapter})
+    capabilities = InstalledExecutionCapabilities.from_descriptors(
+        ("workflow",), workflow_interpreter_profile=WORKFLOW_INTERPRETER_PROFILE,
+        workflow_checkpoint_profile=WORKFLOW_CHECKPOINT_PROFILE, workflow_adapters=executor.adapter_descriptors,
+    )
+    worker = PlatformWorker(worker_services(store), "worker", {"workflow": executor}, capabilities=capabilities)
     assert asyncio.run(worker.run_once())
     assert 0 < observed[0] <= 2
     assert finished == [{"status": "succeeded", "result": {"ok": True}, "error_code": None}]
@@ -166,10 +228,13 @@ def test_expired_model_budget_stops_before_credentials_ledger_or_transport(monke
         def resolve(self, project_key: str, reference: str) -> ModelSecret:
             raise AssertionError("An expired execution must not resolve credentials")
 
-    gateway = PlatformModelGateway(SimpleNamespace(capabilities=SimpleNamespace()), Transport(), Credentials())
+    from infra.schema_validation import IsolatedJSONValidator
+
+    gateway = PlatformModelGateway(SimpleNamespace(resolve_policy=None), SimpleNamespace(), Transport(), Credentials(),
+                                   validator=IsolatedJSONValidator())
     resolved = SimpleNamespace(artifact=claim.artifact,
                                policy=ModelPolicyDefinition(provider_key="provider", model="model"))
-    monkeypatch.setattr(gateway, "resolve_policy", lambda *_args: resolved)
+    monkeypatch.setattr(gateway.policies, "resolve_policy", lambda *_args: resolved)
     with pytest.raises(ExecutionFailure) as failure:
         asyncio.run(gateway.complete(claim, "node", CapabilityDependency(key="policy", version="1"),
                                      ModelMessages(messages=[ModelMessage(role="user", content="hello")])))
@@ -180,7 +245,9 @@ def test_expired_model_budget_stops_before_credentials_ledger_or_transport(monke
 def test_expired_agent_start_does_not_enter_live_resource_resolution():
     claim = claim_for()
     expired = TaskClaim(claim.task, claim.lease, claim.input, claim.artifact, ExecutionBudget(0))
-    artifact = claim.artifact.model_copy(update={"definition": {
+    artifact = claim.artifact.model_copy(update={"dependencies": [
+        CapabilityDependency(key="instructions", version="1"), CapabilityDependency(key="policy", version="1"),
+    ], "definition": {
         "definition_version": "agent.v1", "runtime": "pi",
         "instruction_prompt": {"key": "instructions", "version": "1"},
         "model_policy": {"key": "policy", "version": "1"},
@@ -195,7 +262,8 @@ def test_expired_agent_start_does_not_enter_live_resource_resolution():
             raise AssertionError("An expired Agent must not enter live resource resolution")
 
     invocation = AgentInvocation(expired, CapabilityDependency(key="agent", version="1"), artifact, {})
-    broker = AgentBroker(invocation, Gateway(), AgentRuntimeDescriptor(key="pi", profile="enterprise-ai.pi.v1"))
+    broker = AgentBroker(invocation, Gateway(), AgentRuntimeDescriptor(key="pi", profile="enterprise-ai.pi.v1"),
+                         lifecycle=SimpleNamespace(), prompts=SimpleNamespace())
     with pytest.raises(ExecutionFailure) as failure:
         asyncio.run(broker.open())
     assert failure.value.code == "AGENT_START_TIMEOUT"

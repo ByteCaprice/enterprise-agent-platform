@@ -9,6 +9,7 @@ from infra.store.repository.base import BaseRepository
 
 
 def append_task_event(session, task_id, event_type, *, entity_kind="task", entity_id=None, attempt_id=None):
+    """Append journal evidence and return its sequence; no accounting or delivery."""
     # Writers already own the Task lock, or have just inserted the Task. Flush
     # complete records before allocating; counter + event roll back together.
     session.flush()
@@ -22,9 +23,7 @@ def append_task_event(session, task_id, event_type, *, entity_kind="task", entit
     session.add(AiTaskEvent(task_id=task_id, project_key=head.project_key, sequence=head.event_sequence,
                             task_attempt_id=attempt_id, entity_kind=entity_kind, entity_id=entity_id or task_id,
                             event_type=event_type, occurred_at=session.scalar(text("SELECT clock_timestamp()"))))
-    from infra.store.repository.callbacks import terminal_outbox
-
-    terminal_outbox(session, task_id, head.event_sequence, event_type)
+    return head.event_sequence
 
 
 class TaskEventRepository(BaseRepository):

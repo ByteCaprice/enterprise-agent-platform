@@ -76,7 +76,7 @@ Authorization: Bearer <已由后端明确绑定的 OIDC JWT>
 | 新建能力 / 草稿版本 | `POST /capabilities`、`POST /capabilities/{key}/versions` | `capability:write`；没有草稿覆盖保存接口，修改需新版本 |
 | 发布 / 设置默认版本 | `POST .../{version}/publish`、`POST .../{version}/set-default` | `capability:publish`；发布不执行 Task，也不授权模型/工具 |
 | Prompt 预览 | `POST /prompts/{key}/versions/{version}/render` | `prompt:render`；只渲染已发布的固定版本，不是模型试运行 |
-| Workflow 静态图 | `GET /capabilities/{key}/versions/{version}/plan` | `capability:read`；固定 DSL 的图元数据，不是执行树或可编辑保存模型 |
+| Workflow 计划 / 代码活动声明 | `GET /capabilities/{key}/versions/{version}/plan` | `capability:read`；DSL 返回静态图，代码流程返回活动元数据，不是执行树或可编辑保存模型 |
 | 提交 Task | `POST /tasks` 或 `POST /tasks/execute` | `task:submit`；sync 还要求 `task:read` |
 | Task 列表、详情、结果和证据 | `/tasks`、`/tasks/{id}/...` | `task:read` + 项目/能力/owner 限制 |
 | 请求取消 | `POST /tasks/{id}/cancel` | `task:cancel`；取消意图不等于已停下或已远端回滚 |
@@ -90,6 +90,14 @@ Task 详情是安全元数据，**不返回原始输入供前端自动重建表�
 Key 签发使用 `IssuedServiceKeyResponse`（含一次性 `token`），查询/撤销使用 `ServiceKeyResponse`（不含 `token` 和 `digest`）。撤销通过 `revoked` 标记，过期单独看 `expires_at`，不要假设存在统一 `status` 字段。Grant 重复创建返回已有记录，不签发新的 Key；Key 签发本身没有客户端幂等键，响应丢失后不要自动重复签发，应由管理员核对、撤销或明确重新创建。
 
 能力定义中的 `definition` 随 `kind` 不同而不同，当前 OpenAPI 中它是 JSON 对象，不是已穷尽的可视化编辑器 schema。第一阶段可使用明确 kind 的 JSON/表单编辑，再约定图编辑器；后端契约分别在 `domain/capability.py`、`domain/workflow.py`、`domain/platform_agent.py` 和 `domain/platform_tool.py`。前端不能自行发明等待、审批、写工具、脚本路径或恢复节点。
+
+Workflow V1 可声明 `definition_version: "workflow.v1"`，省略也只表示 V1；节点 `max_attempts` 当前只能为 `1`。不支持的重试在定义校验阶段拒绝。静态计划中的 `compiler_profile`、`interpreter_profile`、`checkpoint_profile` 是后端兼容元数据，前端按字符串展示/保留，不把它们作为切换执行器或允许重放的参数。
+
+`workflow.code.v1` 的计划返回另一类型 `CodeWorkflowPlanRecord`：`control_flow: "code"`，含固定实现引用、`activities` 和 `max_parallelism`。这是尚未发布的活动契约细化，不是新协议版本或已发布定义迁移，也不改变 DSL 的 `nodes`。活动声明包含 `kind`、固定资源、`required`、`max_calls`、`timeout_seconds` 和 `on_unavailable`；Python 控制阶段、实际次序、分支及有界并发，不能按声明数组顺序绘制确定的连线，或把一个活动画成必然只有一次调用。
+
+执行观察仍通过既有 Task 接口：节点使用 `parent_node_id` 和 `scope` 区分流程 frame 与实际调用。scope 包含 `workflow_key`、`version`、`content_hash`，调用还含 `activity_key` / `invocation_hash`；这些 hash 按不透明字符串处理。frame 类型为 `result`，调用类型为 `step|agent|tool|llm|workflow`，不是子 Task。节点终态 `unavailable` 应独立展示安全错误码和部分证据，不表示新增 Task 状态、业务“clear”或可自动重试。skipped 只表示显式跳过；从未调用的可选活动没有记录，不应在客户端补造 skipped 节点。
+
+Task 成功仍依赖后端核对全部层级、终态子 Agent 与结果凭据；前端不能根据局部 succeeded/unavailable 自行推断最终结果。前端不上传源码、安装业务包或选择 Python 函数，也不把声明转换为审批、持久等待或恢复编辑器。详细边界见[业务能力 Hub](capability-hub.md)；后端示例验证不能代替正式前端的联调和验收。
 
 ## 4. Task 的交互状态机
 
@@ -115,6 +123,8 @@ Key 签发使用 `IssuedServiceKeyResponse`（含一次性 `token`），查询/�
 ### 展示、轮询和取消
 
 Task 只有 `queued`、`running`、`succeeded`、`failed`、`timed_out`、`cancelled`。`claimed` 不是公开 Task 状态。`succeeded` 表示技术结果通过校验并提交，不等于业务采纳、评测通过或通知送达。
+
+Worker 领取前还要匹配固定制品所需的解释器、检查点、节点适配器和 Agent Runtime profile。不匹配时任务仍为 `queued`，不会仅因某个 Worker 缺少适配器就消耗 Attempt；前端不把排队改称执行失败，也不自动改版本、Runtime 或重提新任务。
 
 - 可见的 queued/running 详情页可每 2–3 秒轮询状态和新增事件；避免并发重叠请求。列表按需刷新，不为所有行分别轮询详情。
 - 页面隐藏、切换 Task/项目、退出或认证失效时停止轮询；丢弃旧选择/旧身份的迟到响应，不能覆盖当前页面。

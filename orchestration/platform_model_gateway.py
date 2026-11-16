@@ -13,6 +13,8 @@ import json
 
 from domain.capability import CapabilityDependency
 from domain.execution_context import ExecutionDeadlineExceeded
+from domain.execution_ports import ModelCallLedger
+from domain.outbound_operation import OutboundEvidence, evidence_from_exception
 from domain.platform_model import (
     CredentialResolver,
     ModelCallConflict,
@@ -23,10 +25,16 @@ from domain.platform_model import (
     ModelTransportRequest,
     ModelTransportResponse,
 )
-from domain.schema_validation import JSONValidationUnavailable
+from domain.schema_validation import JSONSchemaValidator, JSONValidationUnavailable
 from domain.task import canonical_json
-from domain.task_execution import ExecutionFailure, TaskCancellationRequested, TaskClaim, TaskLeaseLost
-from infra.schema_validation import validate_json
+from domain.task_execution import (
+    ExecutionFailure,
+    ExecutionResourceUnstoppable,
+    TaskCancellationRequested,
+    TaskClaim,
+    TaskLeaseLost,
+)
+from orchestration.execution_async import accounting_error, run_sync
 from orchestration.model_policy_resolver import ModelPolicyResolver, ResolvedModelPolicy
 
 
@@ -43,14 +51,16 @@ def _reject_constant(_value):
     raise ValueError("Non-finite JSON value")
 
 
-class PlatformModelGateway(ModelPolicyResolver):
-    def __init__(self, store, transport: ModelTransport, credentials: CredentialResolver):
-        super().__init__(store)
+class PlatformModelGateway:
+    def __init__(self, policies: ModelPolicyResolver, calls: ModelCallLedger,
+                 transport: ModelTransport, credentials: CredentialResolver, *, validator: JSONSchemaValidator):
+        self.policies = policies
+        self.calls = calls
         self.transport = transport
         self.credentials = credentials
+        self.validator = validator
 
-    @staticmethod
-    def _output(reply: ModelTransportResponse, resolved: ResolvedModelPolicy) -> dict:
+    def _output(self, reply: ModelTransportResponse, resolved: ResolvedModelPolicy) -> dict:
         try:
             if not isinstance(reply.content, str):
                 raise ValueError("Model response content must be text")
@@ -64,31 +74,37 @@ class PlatformModelGateway(ModelPolicyResolver):
         except Exception:
             raise ExecutionFailure("MODEL_OUTPUT_INVALID") from None
         try:
-            validate_json(output, resolved.artifact.output_schema)
+            self.validator.validate(output, resolved.artifact.output_schema)
         except JSONValidationUnavailable:
             raise ExecutionFailure("MODEL_VALIDATION_UNAVAILABLE") from None
         except Exception:
             raise ExecutionFailure("MODEL_OUTPUT_SCHEMA_INVALID") from None
         return output
 
-    async def _finish(self, claim, call_id, *, status, reply=None, output_hash=None, error_code=None, http_status=None):
-        finished = await asyncio.to_thread(
-            self.store.models.finish_call, claim.lease, call_id, status=status,
-            actual_model=reply.actual_model if reply is not None else None,
-            output_hash=output_hash, usage=reply.usage if reply is not None else None,
-            error_code=error_code, http_status=reply.http_status if reply is not None else http_status,
-            provider_request_id=reply.request_id if reply is not None else None,
-        )
+    async def _finish(self, claim, call_id, *, status, reply=None, output_hash=None, error_code=None, evidence=None):
+        evidence = reply.evidence if reply is not None else evidence or OutboundEvidence()
+        if evidence.response != "not_received":
+            evidence = evidence.with_acceptance(status == "succeeded")
+        try:
+            finished = await run_sync(
+                self.calls.finish_call, claim.lease, call_id, status=status,
+                output_hash=output_hash, error_code=error_code, evidence=evidence,
+                _on_cancel_error=accounting_error("MODEL_ACCOUNTING_RESULT_UNKNOWN"),
+            )
+        except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable, ExecutionFailure):
+            raise
+        except Exception:
+            raise ExecutionFailure("MODEL_ACCOUNTING_RESULT_UNKNOWN") from None
         if not finished:
             raise TaskLeaseLost("Model call no longer owns its execution lease")
 
     async def complete(self, claim: TaskClaim, node_id: str, reference: CapabilityDependency,
                         messages: ModelMessages, *, prompt: CapabilityDependency | None = None) -> dict:
-        resolved = await asyncio.to_thread(self.resolve_policy, claim, reference, prompt)
+        resolved = await run_sync(self.policies.resolve_policy, claim, reference, prompt)
         try:
             payload = messages.model_dump(mode="json")
             canonical_json(payload)
-            await asyncio.to_thread(validate_json, payload, resolved.artifact.input_schema)
+            await run_sync(self.validator.validate, payload, resolved.artifact.input_schema)
         except JSONValidationUnavailable:
             raise ExecutionFailure("MODEL_VALIDATION_UNAVAILABLE") from None
         except Exception:
@@ -101,11 +117,11 @@ class PlatformModelGateway(ModelPolicyResolver):
             except ExecutionDeadlineExceeded:
                 raise ExecutionFailure("MODEL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
             # Recheck live grants/provider disablement before each potentially paid attempt.
-            current = await asyncio.to_thread(self.resolve_policy, claim, reference, prompt)
+            current = await run_sync(self.policies.resolve_policy, claim, reference, prompt)
             if current.artifact.content_hash != resolved.artifact.content_hash:
                 raise ExecutionFailure("MODEL_POLICY_CHANGED")
             try:
-                secret = await asyncio.to_thread(self.credentials.resolve, claim.task.project_key, current.provider.credential_ref)
+                secret = await run_sync(self.credentials.resolve, claim.task.project_key, current.provider.credential_ref)
             except ModelTransportFailure as exc:
                 raise ExecutionFailure(exc.code) from None
             except Exception:
@@ -115,25 +131,27 @@ class PlatformModelGateway(ModelPolicyResolver):
             except ExecutionDeadlineExceeded:
                 raise ExecutionFailure("MODEL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
             try:
-                call_id = await asyncio.to_thread(
-                    self.store.models.start_call, claim.lease, node_id, policy_key=reference.key,
+                call_id = await run_sync(
+                    self.calls.start_call, claim.lease, node_id, policy_key=reference.key,
                     policy_version=reference.version, policy_hash=resolved.artifact.content_hash,
                     requested_model=candidate, input_hash=fingerprint,
+                    _on_cancel_error=accounting_error("MODEL_ACCOUNTING_RESULT_UNKNOWN"),
                 )
             except ModelCallConflict:
                 raise ExecutionFailure("MODEL_CALL_CONFLICT") from None
             except ModelConfigurationError:
                 raise ExecutionFailure("MODEL_CONFIGURATION_UNAVAILABLE") from None
-            except (TaskCancellationRequested, ExecutionFailure):
+            except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable, ExecutionFailure):
                 raise
             except Exception:
-                raise ExecutionFailure("MODEL_ACCOUNTING_UNAVAILABLE") from None
+                raise ExecutionFailure("MODEL_ACCOUNTING_RESULT_UNKNOWN") from None
             if call_id is None:
                 raise TaskLeaseLost("Model call no longer owns its execution lease")
             try:
                 timeout_seconds = claim.limit_timeout(current.policy.timeout_seconds)
             except ExecutionDeadlineExceeded:
-                await self._finish(claim, call_id, status="failed", error_code="MODEL_EXECUTION_DEADLINE_EXCEEDED")
+                await self._finish(claim, call_id, status="failed", error_code="MODEL_EXECUTION_DEADLINE_EXCEEDED",
+                                   evidence=OutboundEvidence(dispatch="not_dispatched"))
                 raise ExecutionFailure("MODEL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
             request = ModelTransportRequest(
                 base_url=current.provider.base_url, model=candidate, messages=tuple(messages.messages), secret=secret,
@@ -148,25 +166,30 @@ class PlatformModelGateway(ModelPolicyResolver):
                     claim.limit_timeout(current.policy.timeout_seconds)
                 except ExecutionDeadlineExceeded:
                     raise ExecutionFailure("MODEL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
+            except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable):
+                raise
             except ExecutionFailure as exc:
                 await self._finish(claim, call_id, status="failed", reply=reply, error_code=exc.code)
                 raise
-            except asyncio.CancelledError:
-                await self._finish(claim, call_id, status="cancelled", error_code="MODEL_CANCELLED_RESULT_UNKNOWN")
+            except asyncio.CancelledError as exc:
+                await self._finish(claim, call_id, status="cancelled", reply=reply,
+                                   error_code="MODEL_CANCELLED_RESULT_UNKNOWN", evidence=evidence_from_exception(exc))
                 raise
             except ModelTransportFailure as exc:
-                await self._finish(claim, call_id, status="failed", error_code=exc.code, http_status=exc.http_status)
+                await self._finish(claim, call_id, status="failed", error_code=exc.code, evidence=exc.evidence)
                 if exc.retryable and exc.code == "MODEL_UPSTREAM_UNAVAILABLE" and index + 1 < len(candidates):
                     continue
                 raise ExecutionFailure(exc.code) from None
-            except TimeoutError:
+            except TimeoutError as exc:
                 try:
                     claim.limit_timeout(current.policy.timeout_seconds)
                 except ExecutionDeadlineExceeded:
                     code = "MODEL_EXECUTION_DEADLINE_EXCEEDED"
-                    await self._finish(claim, call_id, status="failed", error_code=code)
+                    await self._finish(claim, call_id, status="failed", error_code=code,
+                                       evidence=evidence_from_exception(exc))
                     raise ExecutionFailure(code, status="timed_out") from None
-                await self._finish(claim, call_id, status="failed", error_code="MODEL_UPSTREAM_TIMEOUT")
+                await self._finish(claim, call_id, status="failed", error_code="MODEL_UPSTREAM_TIMEOUT",
+                                   evidence=evidence_from_exception(exc))
                 raise ExecutionFailure("MODEL_UPSTREAM_TIMEOUT") from None
             except Exception:
                 await self._finish(claim, call_id, status="failed", error_code="MODEL_TRANSPORT_FAILED")
@@ -174,8 +197,8 @@ class PlatformModelGateway(ModelPolicyResolver):
             try:
                 claim.limit_timeout(current.policy.timeout_seconds)
                 # A response does not entitle a revoked principal to receive a result.
-                await asyncio.to_thread(self.resolve_policy, claim, reference, prompt)
-                output = await asyncio.to_thread(self._output, reply, current)
+                await run_sync(self.policies.resolve_policy, claim, reference, prompt)
+                output = await run_sync(self._output, reply, current)
             except asyncio.CancelledError:
                 await self._finish(claim, call_id, status="cancelled", reply=reply,
                                    error_code="MODEL_CANCELLED_RESULT_UNKNOWN")

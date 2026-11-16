@@ -7,6 +7,7 @@ from sqlalchemy import text
 from test_platform_agent_storage import root_fixture
 from test_platform_tasks import inbox as inbox_fixture
 from test_platform_tasks import service_identity
+from worker_support import agent_gateway, tool_gateway
 
 from domain.agent_invocation import AgentInvocation
 from domain.agent_turn import AgentModelTurn, AgentToolCall, AgentTurnResponse
@@ -16,8 +17,7 @@ from framework.agent_runtime.pi.adapter import PiRuntime
 from framework.readonly_tools import builtin_readonly_tools
 from infra.model_credentials import EnvironmentCredentialResolver
 from orchestration.agent_broker import AgentBroker
-from orchestration.agent_model_gateway import PlatformAgentModelGateway
-from orchestration.platform_tool_gateway import PlatformToolGateway
+from orchestration.prompt_renderer import PromptRenderer
 
 inbox = inbox_fixture
 
@@ -42,8 +42,10 @@ class MockTurns:
 
 
 def make_broker(claim, store, transport):
-    tools = PlatformToolGateway(store, builtin_readonly_tools())
-    return AgentBroker(AgentInvocation.from_root(claim), PlatformAgentModelGateway(store, transport, EnvironmentCredentialResolver(), tools), PiRuntime.descriptor)
+    tools = tool_gateway(store, builtin_readonly_tools())
+    gateway = agent_gateway(store, transport, EnvironmentCredentialResolver(), tools)
+    return AgentBroker(AgentInvocation.from_root(claim), gateway, PiRuntime.descriptor,
+                       lifecycle=store.agents, prompts=PromptRenderer(store.capabilities))
 
 
 def test_skill_is_pinned_in_context_and_revocation_blocks_next_model_call(inbox, monkeypatch):
@@ -88,7 +90,7 @@ def test_broker_drives_real_governed_tool_and_final_using_same_ledger_not_fake_n
         assert await broker.dispatch_tool(handle) == {"name": "Synthetic name"}
         assert (await broker.request_model()).kind == "final"
         result = await broker.finish()
-        assert store.tasks.complete(claim.lease, status="succeeded", result=result)
+        assert store.task_completion.complete(claim.lease, status="succeeded", result=result)
 
     asyncio.run(run())
     assert len(transport.requests) == 2
@@ -114,7 +116,7 @@ def test_refusal_retains_usage_and_poisons_broker_without_accepting_intents(inbo
 
     asyncio.run(run())
     assert len(transport.requests) == 1
-    store.tasks.complete(claim.lease, status="failed", error_code="MODEL_RESPONSE_REFUSED")
+    store.task_completion.complete(claim.lease, status="failed", error_code="MODEL_RESPONSE_REFUSED")
     call = client.get(target + "/model-calls", headers={"x-api-key": "synthetic-task-admin"}).json()[0]
     assert call["status"] == "failed" and call["total_tokens"] == 11 and call["output_hash"] is None
     with store.engine.connect() as connection:
@@ -133,4 +135,4 @@ def test_missing_tool_authority_prevents_first_model_request(inbox, monkeypatch)
 
     asyncio.run(run())
     assert not transport.requests
-    store.tasks.complete(claim.lease, status="failed", error_code="TOOL_ACCESS_DENIED")
+    store.task_completion.complete(claim.lease, status="failed", error_code="TOOL_ACCESS_DENIED")

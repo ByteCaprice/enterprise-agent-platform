@@ -1,7 +1,19 @@
 """Safe schema rejection versus bounded validator infrastructure failure."""
 
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import unquote
+
+
+class JSONSchemaValidator(Protocol):
+    """Bounded matching port; callers must distinguish invalid from unavailable."""
+
+    def validate(self, instance: Any, schema: Any) -> None: ...
+
+
+class JSONSchemaInspector(JSONSchemaValidator, Protocol):
+    """Authoring needs schema checking as well as bounded instance matching."""
+
+    def check_schema(self, schema: Any) -> None: ...
 
 
 class JSONValidationError(ValueError):

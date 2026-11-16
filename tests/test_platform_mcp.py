@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,9 +16,10 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from domain.platform_mcp import MCPCatalog
+from domain.platform_mcp import MCP_TEXT_OUTPUT_SCHEMA, MCPCatalog
 from domain.platform_model import ModelSecret
 from domain.platform_tool import ToolContext
+from domain.task import canonical_json
 from domain.task_execution import ExecutionFailure
 from infra.mcp_catalog import catalog_metadata, load_mcp_catalog
 from infra.mcp_http import MCPJSONTransport
@@ -61,11 +64,12 @@ class Credentials:
 
 
 class MockMCP:
-    def __init__(self, *, changed=False, invalid_output=False, close_failure=False):
+    def __init__(self, *, changed=False, invalid_output=False, close_failure=False, public=False):
         self.requests = []
         self.changed = changed
         self.invalid_output = invalid_output
         self.close_failure = close_failure
+        self.public = public
         self.options = []
 
     async def http(self, request):
@@ -74,7 +78,10 @@ class MockMCP:
         assert request.url.host == "8.8.8.8"
         assert request.headers["host"] == "mcp.example.com"
         assert request.extensions["sni_hostname"] == "mcp.example.com"
-        assert request.headers["authorization"] == "Bearer synthetic-secret"
+        if self.public:
+            assert "authorization" not in request.headers
+        else:
+            assert request.headers["authorization"] == "Bearer synthetic-secret"
         assert request.headers["accept-encoding"] == "identity"
         if request.method == "DELETE":
             return httpx.Response(500 if self.close_failure else 204)
@@ -128,6 +135,152 @@ def test_real_json_session_initializes_checks_schema_calls_and_deletes_without_r
     assert [payload.get("method", "DELETE") for _, payload in mock.requests] == [
         "initialize", "notifications/initialized", "tools/list", "tools/call", "DELETE"]
     assert len(mock.options) == 1  # One isolated client; no ambient proxy, reconnect or shared session.
+
+
+@pytest.mark.parametrize("explicit_null", [False, True])
+def test_public_session_never_resolves_credentials_or_sends_authorization(monkeypatch, explicit_null):
+    data = catalog().model_dump(mode="json")
+    data["connections"][0].pop("credential_ref")
+    if explicit_null:
+        data["connections"][0]["credential_ref"] = None
+    approved = MCPCatalog.model_validate(data)
+    mock = MockMCP(public=True)
+
+    def fail(*_args):
+        pytest.fail("Public sessions must not look up environment credentials")
+
+    monkeypatch.setattr("infra.mcp_http.EnvironmentCredentialResolver.resolve", fail)
+    mock.transport = lambda: MCPJSONTransport(resolver=mock.resolve, client_factory=mock.client)
+    assert asyncio.run(installed(mock, approved).execute(CONTEXT, VALUES)) == {"name": "Synthetic"}
+    assert [payload.get("method", "DELETE") for _, payload in mock.requests] == [
+        "initialize", "notifications/initialized", "tools/list", "tools/call", "DELETE"]
+
+
+def text_catalog():
+    data = catalog().model_dump(mode="json")
+    data["tools"][0].update(result_mode="text", output_schema=MCP_TEXT_OUTPUT_SCHEMA)
+    return MCPCatalog.model_validate(data)
+
+
+def text_mock(result, *, schemaless=True):
+    mock = MockMCP()
+    real_http = mock.http
+
+    async def http(request):
+        response = await real_http(request)
+        payload = json.loads(request.content) if request.content else {}
+        if payload.get("method") not in {"tools/list", "tools/call"}:
+            return response
+        body = response.json()
+        if payload["method"] == "tools/list":
+            if schemaless:
+                body["result"]["tools"][0].pop("outputSchema")
+        else:
+            body["result"] = result
+        return httpx.Response(200, json=body)
+
+    mock.http = http
+    return mock
+
+
+@pytest.mark.parametrize("chunks", [["plain text", '{"not": "parsed"}'], [""]])
+def test_explicit_text_results_are_wrapped_without_json_inference(chunks):
+    approved = text_catalog()
+    mock = text_mock({"content": [{"type": "text", "text": text} for text in chunks]})
+    handler = installed(mock, approved)
+    approved.tools[0].output_schema.clear()  # Installed pins retain their immutable snapshot.
+    assert asyncio.run(handler.execute(CONTEXT, VALUES)) == {"text": "\n".join(chunks)}
+    assert mock.requests[-1][0].method == "DELETE"
+
+
+@pytest.mark.parametrize("result", [
+    {"content": []}, {}, {"content": [{"type": "image", "data": "synthetic"}]},
+    {"content": [{"type": "text", "text": 1}]},
+    *[{"content": [{"type": "text", "text": "ignored"}], "isError": flag} for flag in [True, 0, "false", None]],
+    {"content": [{"type": "text", "text": "ignored"}], "structuredContent": {}},
+])
+def test_text_mode_rejects_empty_errors_nontext_and_structured_results(result):
+    mock = text_mock(result)
+    with pytest.raises(ExecutionFailure, match="TOOL_MCP_OUTPUT_REJECTED"):
+        asyncio.run(installed(mock, text_catalog()).execute(CONTEXT, VALUES))
+    assert mock.requests[-1][0].method == "DELETE"
+
+
+def test_text_mode_requires_absent_remote_output_schema_and_matching_input():
+    for schemaless, changed in [(False, False), (True, True)]:
+        mock = text_mock({"content": [{"type": "text", "text": "ignored"}]}, schemaless=schemaless)
+        mock.changed = changed
+        with pytest.raises(ExecutionFailure, match="TOOL_MCP_SCHEMA_CHANGED"):
+            asyncio.run(installed(mock, text_catalog()).execute(CONTEXT, VALUES))
+        assert not [payload for _, payload in mock.requests if payload.get("method") == "tools/call"]
+
+
+def test_default_structured_mode_does_not_accept_text_only_results():
+    mock = text_mock({"content": [{"type": "text", "text": '{"name":"Synthetic"}'}]}, schemaless=False)
+    with pytest.raises(ExecutionFailure, match="TOOL_MCP_OUTPUT_REJECTED"):
+        asyncio.run(installed(mock).execute(CONTEXT, VALUES))
+
+
+@pytest.mark.parametrize("schema", [OUTPUT, {"type": "object"},
+                                    {**MCP_TEXT_OUTPUT_SCHEMA, "additionalProperties": True}])
+def test_text_mode_requires_the_exact_local_wrapper(schema):
+    data = text_catalog().model_dump(mode="json")
+    data["tools"][0]["output_schema"] = schema
+    with pytest.raises(ValidationError, match="MCP_TEXT_OUTPUT_SCHEMA"):
+        MCPCatalog.model_validate(data)
+
+
+def test_result_mode_is_hashed_without_changing_existing_authenticated_handler_versions():
+    approved = catalog()
+    connection, pin = approved.connections[0], approved.tools[0]
+    old_tool = pin.model_dump(mode="json", exclude={"result_mode"})
+    old_snapshot = {"profile": "enterprise-ai-mcp-json-v1", "connection": connection.model_dump(mode="json"),
+                    "tool": old_tool}
+    assert pin.handler_version(connection) == hashlib.sha256(canonical_json(old_snapshot).encode()).hexdigest()
+    data = approved.model_dump(mode="json")
+    data["tools"][0].pop("result_mode")
+    assert MCPCatalog.model_validate(data).tools[0].handler_version(connection) == pin.handler_version(connection)
+    text = text_catalog().tools[0]
+    structured = text.model_copy(update={"result_mode": "structured"})
+    assert text.handler_version(connection) != structured.handler_version(connection)
+
+
+@pytest.mark.parametrize("phase", ["input", "output"])
+def test_cancelled_mcp_validation_does_not_leave_a_detached_thread(monkeypatch, phase):
+    async def run():
+        mock = MockMCP()
+        started = asyncio.Event()
+        release, stopped = threading.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        validations = []
+
+        def validate(_value, _schema):
+            validations.append(True)
+            if len(validations) == (1 if phase == "input" else 2):
+                loop.call_soon_threadsafe(started.set)
+                try:
+                    assert release.wait(3), "Test did not release validation"
+                finally:
+                    stopped.set()
+
+        monkeypatch.setattr("orchestration.mcp_tools.validate_json", validate)
+        task = asyncio.create_task(installed(mock).execute(CONTEXT, VALUES))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done() and not stopped.is_set()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert stopped.is_set()
+        if phase == "input":
+            assert mock.requests == []
+        else:
+            assert mock.requests[-1][0].method == "DELETE"
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("case,code", [("changed", "TOOL_MCP_SCHEMA_CHANGED"),
@@ -317,7 +470,7 @@ def test_catalog_cli_is_offline_and_does_not_print_endpoint_or_credentials(tmp_p
     def fail(*_args, **_kwargs):
         pytest.fail("Offline catalog check must not bootstrap or access the database")
 
-    monkeypatch.setattr("interfaces.cli.platform.create_platform_app", fail)
+    monkeypatch.setattr("interfaces.cli.platform.create_runtime", fail)
     main(["check-mcp-catalog", "--mcp-catalog", str(path)])
     output = capsys.readouterr().out
     assert json.loads(output)["tools"] == catalog_metadata(catalog())
@@ -332,7 +485,7 @@ def test_worker_cli_forwards_only_explicit_validated_catalog_and_closes_store(tm
     path.write_text(catalog().model_dump_json())
     closed = []
     store = SimpleNamespace(close=lambda: closed.append(True))
-    monkeypatch.setattr("interfaces.cli.platform.create_platform_app", lambda _path: SimpleNamespace(state=SimpleNamespace(store=store)))
+    monkeypatch.setattr("interfaces.cli.platform.create_runtime", lambda _path: SimpleNamespace(store=store, close=store.close))
 
     async def worker(received_store, *, worker_id, once, mcp_catalog):
         assert received_store is store and worker_id == "test-worker" and once is True

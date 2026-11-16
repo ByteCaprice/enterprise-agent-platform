@@ -232,7 +232,9 @@ class ExecutionQueryRepository(BaseRepository):
     @staticmethod
     def _tree_item(rank, row):
         if rank == 0:
-            return WorkflowNodeItem(parent=ExecutionRef(kind="attempt", id=row.task_attempt_id), record=row)
+            parent = (ExecutionRef(kind="workflow_node", id=row.parent_node_id) if row.parent_node_id is not None
+                      else ExecutionRef(kind="attempt", id=row.task_attempt_id))
+            return WorkflowNodeItem(parent=parent, record=row)
         if rank == 1:
             parent = (ExecutionRef(kind="workflow_node", id=row.parent_node_id) if row.parent_node_id is not None
                       else ExecutionRef(kind="attempt", id=row.task_attempt_id))

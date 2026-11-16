@@ -27,6 +27,7 @@ from domain.task_event import TaskEventPage
 from domain.task_execution import TaskAttemptRecord, TaskResultRecord
 from domain.workflow import WorkflowNodeRecord
 from domain.workflow_recovery import WorkflowRecoveryAssessment
+from infra.schema_validation import IsolatedJSONValidator
 from interfaces.http.gateway_context import GatewayContext, gateway_response_headers
 from interfaces.http.platform_auth import Principal
 from orchestration.gateway_service import GatewayService
@@ -36,7 +37,7 @@ router = APIRouter(prefix="/v2/projects/{project_key}/tasks", tags=["tasks"])
 
 
 def _service(request):
-    return TaskService(request.app.state.store, request.app.state.control_plane_auth)
+    return TaskService(request.app.state.store, request.app.state.control_plane_auth, validator=IsolatedJSONValidator())
 
 
 def _call(callback, *args, **kwargs):
@@ -59,7 +60,7 @@ def _call(callback, *args, **kwargs):
              responses={200: {"model": TaskRecord, "description": "Existing task returned for an identical submission"}})
 def submit_task(request: Request, response: Response, project_key: str, payload: TaskSubmit, principal: Principal,
                 idempotency_key: Annotated[IdempotencyKey, Header()], context: GatewayContext):
-    service = GatewayService(request.app.state.store, request.app.state.control_plane_auth)
+    service = GatewayService(request.app.state.store, request.app.state.control_plane_auth, validator=IsolatedJSONValidator())
     admission = _call(service.submit, principal, project_key, payload, idempotency_key, context=context)
     record = admission.task
     response.status_code = 202 if admission.request.task_created else 200
@@ -77,7 +78,7 @@ async def execute_task(request: Request, response: Response, project_key: str, p
     service = _service(request)
     if payload.mode == "sync":
         await asyncio.to_thread(_call, service._access, principal, project_key, "task:read", payload.task.capability_key)
-    gateway = GatewayService(request.app.state.store, request.app.state.control_plane_auth)
+    gateway = GatewayService(request.app.state.store, request.app.state.control_plane_auth, validator=IsolatedJSONValidator())
     admission = await asyncio.to_thread(
         _call, gateway.submit, principal, project_key, payload.task, idempotency_key,
         context=context, operation="execute", delivery_mode=payload.mode,

@@ -6,6 +6,7 @@ from pathlib import PurePosixPath
 DOCS = (
     "docs/README.md", "docs/overview.md", "docs/api.md", "docs/deployment.md",
     "docs/development.md", "docs/roadmap.md", "docs/repository-policy.md", "docs/frontend-integration.md",
+    "docs/capability-hub.md", "docs/weather-query-demo.md", "docs/agent-skills-mcp.md",
 )
 PUBLIC_MARKDOWN = ("README.md", "CONTRIBUTING.md", *DOCS)
 PUBLIC_NOTICES = ("tests/fixtures/trade_documents/README.md",)
@@ -19,10 +20,10 @@ PUBLIC_STRUCTURED = (
     "docker/platform/compose.yaml", "docker/platform/deployment-policy.example.json",
 )
 LOCAL_ROOT_FILES = {"rebuild-guide.md", "dev-config.txt", "uv.toml"}
-SOURCE_ROOTS = {"domain", "infra", "framework", "orchestration", "interfaces", "tests", "scripts", "docs", "docker"}
+SOURCE_ROOTS = {"domain", "infra", "framework", "orchestration", "interfaces", "capability_hub", "tests", "scripts", "docs", "docker"}
 SOURCE_ROOT_FILES = {".gitignore", "README.md", "CONTRIBUTING.md", "pyproject.toml", "uv.lock", "MANIFEST.in"}
 PRIVATE_PARTS = {
-    ".local", ".local-deploy", "private", "secrets", "credentials", ".git", ".hg", ".svn", ".ssh", ".aws", ".azure", ".kube",
+    ".local", ".local-deploy", "private", "secrets", "credentials", "config", ".git", ".hg", ".svn", ".ssh", ".aws", ".azure", ".kube",
     ".gcloud", ".terraform", ".idea", ".vscode", ".claude", ".codex", ".cursor", ".pi",
     ".playwright-mcp", "playwright-report", "test-results",
     "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache", ".ruff_cache", ".mypy_cache",
@@ -55,11 +56,15 @@ PROTECTED_PATHS = (
     "exports/customer.csv", "private/signing.key", "signing.pem", "deployment-policy.json", "mcp-catalog.json",
     "private-settings.yaml", "nested/.ssh/id_ed25519", "nested/credentials/client.ini", "terraform.tfstate",
     "screenshots/page.png", "trace.har", "tests/fixtures/trade_documents/test.pdf", "tests/fixtures/unknown/customer.json",
+    "capability_hub/private/settings.py", "capability_hub/config/settings.py", "capability_hub/weather_query/.env.local",
+    "capability_hub/remitter_search/customer.csv",
+    "capability_hub/.claude/settings.json", "capability_hub/deployment.key", "capability_hub/internal-notes.md",
 )
 SOURCE_PATHS = (
     ".gitignore", "MANIFEST.in", "pyproject.toml", "uv.lock", "domain/task.py", "interfaces/http/console/icon.svg",
     "infra/_schema_worker.py", "infra/platform_migrations/versions/schema.sql",
     "framework/agent_runtime/pi/node/platform-runner.mjs", "docker/platform/Dockerfile",
+    "capability_hub/catalog.py", "capability_hub/remitter_search/workflow.py", "capability_hub/weather_query/tools.py",
     "docker/platform/Dockerfile.dockerignore", *PUBLIC_STRUCTURED, *PUBLIC_TEMPLATES, *PUBLIC_NOTICES,
     *PUBLIC_SCRIPTS, *PUBLIC_MARKDOWN,
 )
@@ -105,4 +110,4 @@ def private_distribution_path(name: str) -> bool:
         )
         if not legal_notice:
             return True
-    return parts[0] not in {"domain", "infra", "framework", "orchestration", "interfaces"} and not parts[0].endswith(".dist-info")
+    return parts[0] not in {"domain", "infra", "framework", "orchestration", "interfaces", "capability_hub"} and not parts[0].endswith(".dist-info")

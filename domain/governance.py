@@ -37,6 +37,7 @@ class CapabilityAction(StrEnum):
     MODEL_INVOKE = "model:invoke"
     TOOL_INVOKE = "tool:invoke"
     AGENT_INVOKE = "agent:invoke"
+    WORKFLOW_INVOKE = "workflow:invoke"
     SKILL_USE = "skill:use"
     MEMORY_READ = "memory:read"
     MEMORY_WRITE = "memory:write"

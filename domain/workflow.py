@@ -9,7 +9,14 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
-from domain.capability import CapabilityDependency, Key, Version
+from domain.business_code import CodeNodeScope
+from domain.capability import CapabilityDependency, CapabilityError, Key, Version
+
+
+class WorkflowContractError(CapabilityError):
+    def __init__(self, code: str, message: str | None = None):
+        self.code = code
+        super().__init__(message or code)
 
 
 class WorkflowBinding(BaseModel):
@@ -85,6 +92,8 @@ class WorkflowNode(BaseModel):
 class WorkflowDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
+    # Omitted in the original V1 DSL means V1, never "latest installed".
+    definition_version: Literal["workflow.v1"] = "workflow.v1"
     nodes: list[WorkflowNode] = Field(min_length=1, max_length=100)
     output_mapping: Bindings = Field(default_factory=dict)
     max_parallel_rules: int = Field(default=1, strict=True, ge=1, le=8)
@@ -111,6 +120,14 @@ class WorkflowDefinition(BaseModel):
             raise ValueError("Workflow output references an unknown node")
         return ordered
 
+    def require_execution_contract(self) -> None:
+        try:
+            self.ordered_nodes()
+        except ValueError as exc:
+            raise WorkflowContractError("WORKFLOW_DEFINITION_INVALID", str(exc)) from None
+        if any(node.max_attempts != 1 for node in self.nodes):
+            raise WorkflowContractError("WORKFLOW_RETRY_NOT_SUPPORTED")
+
 
 class WorkflowNodeRecord(BaseModel):
     """Timeline metadata: no input/output payload, definition or lease credential."""
@@ -129,6 +146,8 @@ class WorkflowNodeRecord(BaseModel):
     start_time: datetime
     finish_time: datetime | None = None
     error_code: str | None = None
+    parent_node_id: str | None = None
+    scope: CodeNodeScope | None = None
 
 
 class WorkflowPlanNodeRecord(BaseModel):
@@ -155,6 +174,8 @@ class WorkflowPlanRecord(BaseModel):
     version: Version
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     compiler_profile: Literal["enterprise-ai.workflow.plan.v1"] = "enterprise-ai.workflow.plan.v1"
+    interpreter_profile: Literal["enterprise-ai.workflow.interpreter.v1"] = "enterprise-ai.workflow.interpreter.v1"
+    checkpoint_profile: Literal["enterprise-ai.workflow.checkpoint.v2"] = "enterprise-ai.workflow.checkpoint.v2"
     required_adapters: list[Literal["agent", "tool", "llm"]]
     max_parallel_rules: int
     nodes: list[WorkflowPlanNodeRecord]

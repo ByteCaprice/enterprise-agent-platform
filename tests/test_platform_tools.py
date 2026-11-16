@@ -9,15 +9,17 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from test_platform_tasks import ADMIN, service_identity, submit
 from test_platform_tasks import inbox as inbox_fixture
+from worker_support import tool_gateway
 
 from domain.capability import CapabilityDependency, CapabilitySpec, CapabilityVersionDraft
+from domain.capability_definitions import WORKFLOW_CHECKPOINT_PROFILE, WORKFLOW_INTERPRETER_PROFILE
 from domain.platform_tool import InstalledReadonlyTool
 from domain.task_execution import ExecutionFailure
 from framework.readonly_tools import ReadonlyToolRegistry, builtin_readonly_tools
+from infra.schema_validation import IsolatedJSONValidator
 from interfaces.cli.platform import main
 from interfaces.worker.platform import run_workflow_worker
 from orchestration.capability_service import CapabilityService
-from orchestration.platform_tool_gateway import PlatformToolGateway
 
 inbox = inbox_fixture
 BINDINGS = "/v2/projects/payments/tool-bindings"
@@ -33,7 +35,7 @@ def setup_tool(client, store, *, handler="json.project", version="1", timeout=30
         "handler_version": version, "operation_type": "read_only", "max_timeout_seconds": 30,
     })
     assert response.status_code == 201
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     service.create("payments", CapabilitySpec(key="select-fields", kind="tool", name="Select fields"), "task-admin")
     schema = {"type": "object", "properties": {"name": {"type": "string"}},
               "required": ["name"], "additionalProperties": False}
@@ -76,7 +78,7 @@ def grant(client, identity):
 
 def execute(store, handler=None):
     registry = ReadonlyToolRegistry([InstalledReadonlyTool("test.handler", "1", handler)]) if handler else builtin_readonly_tools()
-    return asyncio.run(run_workflow_worker(store, once=True, tool_gateway=PlatformToolGateway(store, registry)))
+    return asyncio.run(run_workflow_worker(store, once=True, tool_gateway=tool_gateway(store, registry)))
 
 
 def test_cli_builtin_tool_executes_real_projection_with_scoped_metadata_and_immutable_binding(inbox, capsys):
@@ -203,7 +205,7 @@ def test_expired_tool_reply_is_fenced_and_recovery_finalizes_pending_evidence(in
 
     assert execute(store, handler)
     assert client.get(target, headers=ADMIN).json()["status"] == "running"
-    assert store.tasks.recover_expired() == 1
+    assert store.task_queue.recover_expired() == 1
     call = client.get(target + "/tool-calls", headers=ADMIN).json()[0]
     assert call["status"] == "failed" and call["error_code"] == "TOOL_LEASE_EXPIRED_RESULT_UNKNOWN"
     assert call["output_hash"] is None
@@ -214,9 +216,13 @@ def test_tool_call_cannot_be_replayed_and_null_success_hash_is_rejected(inbox):
     client, store = inbox
     setup_tool(client, store)
     accept(client)
-    claim = store.tasks.claim("tool-ledger-worker", kinds=("workflow",), lease_seconds=60)
-    checkpoint = store.workflows.begin(claim.lease, "select", "a" * 64)
-    gateway = PlatformToolGateway(store, builtin_readonly_tools())
+    from worker_support import worker_capabilities
+
+    claim = store.task_queue.claim("tool-ledger-worker", capabilities=worker_capabilities("workflow"), lease_seconds=60)
+    checkpoint = store.workflows.begin(claim.lease, "select", "a" * 64,
+                                       interpreter_profile=WORKFLOW_INTERPRETER_PROFILE,
+                                       checkpoint_profile=WORKFLOW_CHECKPOINT_PROFILE)
+    gateway = tool_gateway(store, builtin_readonly_tools())
     reference = CapabilityDependency(key="select-fields", version="1")
     values = {"data": {"name": "Synthetic"}, "fields": ["name"]}
     assert asyncio.run(gateway.invoke(claim, checkpoint.record.id, reference, values)) == {"name": "Synthetic"}
@@ -241,7 +247,7 @@ def test_call_audit_failure_rolls_back_evidence_and_never_runs_handler(inbox, mo
     def fail(*_args, **_kwargs):
         raise RuntimeError("synthetic-private-audit-error")
 
-    monkeypatch.setattr(store.tool_bindings, "_audit", fail)
+    monkeypatch.setattr("infra.store.repository.tools.record_tool_call_transition", fail)
     target = accept(client)
     assert execute(store, handler) and not seen
     result = client.get(target + "/result", headers=ADMIN)
@@ -252,14 +258,16 @@ def test_call_audit_failure_rolls_back_evidence_and_never_runs_handler(inbox, mo
 def test_finish_audit_failure_preserves_unknown_outcome_instead_of_delivering_success(inbox, monkeypatch):
     client, store = inbox
     setup_tool(client, store)
-    real_audit = store.tool_bindings._audit
+    from infra.store.repository import tools
+
+    real_transition = tools.record_tool_call_transition
 
     def fail_finish(session, project, actor, event, **kwargs):
         if event == "tool_call_succeeded":
             raise RuntimeError("synthetic-private-finish-error")
-        return real_audit(session, project, actor, event, **kwargs)
+        return real_transition(session, project, actor, event, **kwargs)
 
-    monkeypatch.setattr(store.tool_bindings, "_audit", fail_finish)
+    monkeypatch.setattr(tools, "record_tool_call_transition", fail_finish)
     target = accept(client)
     assert execute(store)
     result = client.get(target + "/result", headers=ADMIN).json()

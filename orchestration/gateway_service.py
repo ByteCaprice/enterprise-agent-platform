@@ -9,24 +9,26 @@ from domain.gateway import (
     GatewayRequestContext,
     GatewayRequestCreate,
 )
+from domain.schema_validation import JSONSchemaValidator
 from domain.task import TaskError, TaskRecord, TaskSubmit
+from domain.task_admission import AdmissionScope
 from orchestration.task_service import TaskService
 
 
 class GatewayService:
-    def __init__(self, store, auth):
+    def __init__(self, store, auth, *, validator: JSONSchemaValidator | None = None):
         self.store = store
         self.auth = auth
-        self.tasks = TaskService(store, auth)
+        self.tasks = TaskService(store, auth, validator=validator)
 
     def _record(self, task: TaskRecord, created: bool, context: GatewayRequestContext, operation: GatewayOperation,
-                delivery_mode: DeliveryMode, *, conn) -> GatewayAdmission:
+                 delivery_mode: DeliveryMode, *, admission: AdmissionScope) -> GatewayAdmission:
         command = GatewayRequestCreate(
             id=context.request_id, correlation_id=context.correlation_id,
             project_key=task.project_key, task_id=task.id, submitted_by=task.submitted_by,
             operation=operation, delivery_mode=delivery_mode, task_created=created,
         )
-        request = self.store.gateway_requests.create(command, conn=conn)
+        request = admission.record_gateway(command)
         return GatewayAdmission(task=task, request=request)
 
     def submit(self, principal, project_key, spec: TaskSubmit, idempotency_key, *, context: GatewayRequestContext,
@@ -37,14 +39,16 @@ class GatewayService:
             raise TaskError("Invalid gateway delivery preferences")
         # Task creation/reuse and request evidence commit together. A failed
         # evidence insert cannot leave an untraceable newly accepted Task.
-        with self.store.unit_of_work() as conn:
-            task, created = self.tasks.submit(principal, project_key, spec, idempotency_key, conn=conn)
-            return self._record(task, created, context, operation, delivery_mode, conn=conn)
+        prepared = self.tasks.prepare(principal, project_key, spec, idempotency_key)
+        with self.tasks.admission.unit_of_work(project_key, self.tasks.owner(principal)) as admission:
+            task, created = admission.admit(prepared)
+            return self._record(task, created, context, operation, delivery_mode, admission=admission)
 
     def recover(self, principal, project_key, task_id, request_key, *, context: GatewayRequestContext) -> GatewayAdmission:
-        with self.store.unit_of_work() as conn:
-            task, created = self.tasks.recover(principal, project_key, task_id, request_key, conn=conn)
-            return self._record(task, created, context, "recover", "async", conn=conn)
+        prepared = self.tasks.prepare_recovery(principal, project_key, task_id, request_key)
+        with self.tasks.admission.unit_of_work(project_key, self.tasks.owner(principal)) as admission:
+            task, created = admission.admit(prepared)
+            return self._record(task, created, context, "recover", "async", admission=admission)
 
     def _read_scope(self, principal, project_key):
         allowed = self.auth.allowed_resources(principal, project_key, "task:read")

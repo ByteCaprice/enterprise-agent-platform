@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import Engine
 from sqlalchemy.orm import sessionmaker
 
+from infra.store.repository.admission import AdmissionRepository
 from infra.store.repository.agents import AgentRepository
 from infra.store.repository.api_keys import ApiKeyConfigRepository
 from infra.store.repository.callbacks import CallbackRepository
@@ -26,9 +27,12 @@ from infra.store.repository.memory import MemoryRepository
 from infra.store.repository.models import ModelRepository
 from infra.store.repository.oidc import OIDCRepository
 from infra.store.repository.operations import OperationsRepository
+from infra.store.repository.quality import QualityRepository
 from infra.store.repository.task import TaskRepository
+from infra.store.repository.task_completion import TaskCompletionRepository
 from infra.store.repository.task_control import TaskControlRepository
 from infra.store.repository.task_events import TaskEventRepository
+from infra.store.repository.task_queue import TaskQueueRepository
 from infra.store.repository.tools import ToolRepository
 from infra.store.repository.worker_health import WorkerHealthRepository
 from infra.store.repository.workflow import WorkflowRepository
@@ -45,6 +49,10 @@ class PlatformStore:
         self.governance = GovernanceRepository(self._sf)
         self.gateway_requests = GatewayRequestRepository(self._sf)
         self.tasks = TaskRepository(self._sf)
+        self.admission = AdmissionRepository(self._sf, self.tasks, self.gateway_requests)
+        self.quality = QualityRepository(self._sf)
+        self.task_queue = TaskQueueRepository(self._sf)
+        self.task_completion = TaskCompletionRepository(self._sf)
         self.task_control = TaskControlRepository(self._sf)
         self.task_events = TaskEventRepository(self._sf)
         self.models = ModelRepository(self._sf)

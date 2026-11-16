@@ -5,6 +5,7 @@ recursive-include infra *.py *.sql
 recursive-include interfaces *.py *.html *.css *.js *.svg
 recursive-include orchestration *.py
 recursive-include framework *.py *.mjs
+recursive-include capability_hub *.py
 include framework/agent_runtime/pi/node/package.json
 include framework/agent_runtime/pi/node/package-lock.json
 include framework/agent_runtime/pi/node/platform-runner.mjs
@@ -94,8 +95,32 @@ prune framework/**/config
 prune framework/**/.local
 prune framework/**/.local-deploy
 prune framework/**/.git
+prune capability_hub/private
+prune capability_hub/secrets
+prune capability_hub/credentials
+prune capability_hub/config
+prune capability_hub/.local
+prune capability_hub/.local-deploy
+prune capability_hub/.git
+prune capability_hub/**/private
+prune capability_hub/**/secrets
+prune capability_hub/**/credentials
+prune capability_hub/**/config
+prune capability_hub/**/.local
+prune capability_hub/**/.local-deploy
+prune capability_hub/**/.git
 
 exclude dev-config.txt
 recursive-exclude * __pycache__ *.py[cod] *.env *.pem *.key *.p12 *.pfx *.jks *.keystore *.log *.db *.sqlite* *.dump *.backup *.bak *.jsonl *.ndjson *.csv *.zip *.tar *.tar.gz *.tgz *.7z *.whl *.har *.pcap *.trace *.pdf *.docx *.xlsx
 recursive-exclude * .env*
 recursive-exclude * secrets credentials private .local .local-deploy
+
+# Final recursive denials also cover hidden assistants, identity stores and
+# private configuration nested arbitrarily deep inside reviewed packages.
+global-exclude **/config/** **/private/** **/secrets/** **/credentials/**
+global-exclude **/.local/** **/.local-deploy/** **/.git/** **/.hg/** **/.svn/**
+global-exclude **/.claude/** **/.codex/** **/.cursor/** **/.pi/** **/.idea/** **/.vscode/**
+global-exclude **/.ssh/** **/.aws/** **/.azure/** **/.kube/** **/.gcloud/** **/.terraform/**
+global-exclude **/.playwright-mcp/** **/__pycache__/** **/node_modules/** **/.venv/**
+global-exclude .gitconfig .git-credentials .pypirc .npmrc .netrc pip.conf .aider* .DS_Store
+global-exclude AGENTS.md CLAUDE.md GEMINI.md *.iml *.code-workspace *.pub *.crt *.cer

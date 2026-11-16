@@ -16,9 +16,10 @@ from sqlalchemy import select, text
 
 from domain import LogEvent
 from domain.capability import AgentTurnPolicyDefinition, PromptDefinition
+from domain.capability_definitions import interpret_definition
+from domain.outbound_operation import OutboundEvidence
 from domain.platform_agent import (
     AgentCapabilityRef,
-    AgentDefinition,
     AgentStorageConflict,
     AgentStorageError,
     AgentToolIntent,
@@ -39,9 +40,14 @@ from infra.store.model.ai_run_log import AiRunLog
 from infra.store.model.ai_workflow_node import AiWorkflowNode
 from infra.store.repository.base import BaseRepository
 from infra.store.repository.execution import ExecutionWriteMode, active_execution, fence_execution_write
-from infra.store.repository.models import ModelRepository
+from infra.store.repository.execution_effects import (
+    record_model_call_settled,
+    record_model_call_started,
+    record_tool_call_transition,
+)
+from infra.store.repository.outcome_effects import record_outbound_evidence
 from infra.store.repository.task_events import append_task_event
-from infra.store.repository.tools import ToolRepository
+from infra.store.repository.workflow_scope import declared_workflow_activity
 
 
 def _hash(value):
@@ -122,26 +128,25 @@ class AgentRepository(BaseRepository):
         else:
             if identity.kind != "workflow":
                 raise AgentStorageError("Embedded Agent requires a Workflow Task")
-            _, workflow = _resource(session, task.project_key, AgentCapabilityRef(key=identity.key, version=task.version), "workflow")
-            if workflow.content_hash != task.content_hash:
-                raise AgentStorageError("Workflow snapshot changed")
             parent = session.scalar(select(AiWorkflowNode).where(
                 AiWorkflowNode.id == parent_node_id, AiWorkflowNode.task_id == task.id,
             ).with_for_update())
-            declared = next((node for node in workflow.definition.get("nodes", [])
-                             if parent is not None and node.get("key") == parent.node_key), None)
-            if parent is None or parent.kind != "agent" or declared is None or declared.get("kind") != "agent":
+            if parent is None or parent.kind != "agent" or parent.status != "running":
                 raise AgentStorageError("Real Agent parent node unavailable")
-            reference = AgentCapabilityRef.model_validate(declared.get("capability"))
-            if reference.model_dump() not in workflow.dependencies:
+            try:
+                declared, _, reference = declared_workflow_activity(session, task, parent)
+            except ValueError:
+                raise AgentStorageError("Workflow Agent declaration unavailable") from None
+            if declared.kind != "agent" or reference is None:
                 raise AgentStorageError("Workflow Agent dependency must be pinned")
+            reference = AgentCapabilityRef.model_validate(reference.model_dump())
         capability, artifact = _resource(session, task.project_key, reference, "agent")
         if parent_node_id is None and artifact.content_hash != task.content_hash:
             raise AgentStorageError("Agent does not match Task snapshot")
-        definition = AgentDefinition.model_validate(artifact.definition)
-        declared = {(ref["key"], ref["version"]) for ref in artifact.dependencies}
-        if any((ref.key, ref.version) not in declared for ref in definition.dependency_refs()):
-            raise AgentStorageError("Agent dependencies must be pinned")
+        try:
+            definition = interpret_definition("agent", artifact.to_domain()).materialize()
+        except ValueError:
+            raise AgentStorageError("Agent definition unavailable") from None
         for reference, kind in [(definition.instruction_prompt, "prompt"), (definition.model_policy, "model_policy"),
                                 *((tool.capability, "tool") for tool in definition.tools),
                                 *((skill, "skill") for skill in definition.skills)]:
@@ -267,12 +272,17 @@ class AgentRepository(BaseRepository):
                 status="running", input_hash=input_hash, start_time=now,
             )
             session.add(call)
-            ModelRepository._audit(session, task.project_key, task.id, call.id, lease.worker_id, "model_call_started")
+            record_model_call_started(session, task.project_key, task.id, call.id, lease.worker_id)
             fence_execution_write(session, lease)
             return step.to_record(), call.id
 
     def accept_turn(self, lease, execution_id, step_id, *, output_hash, actual_model,
-                    final_result=None, intents=(), usage: ModelUsage | None = None, http_status=None, request_id=None):
+                    final_result=None, intents=(), usage: ModelUsage | None = None, http_status=None, request_id=None,
+                    evidence=None):
+        if evidence is not None:
+            evidence = OutboundEvidence.model_validate(evidence).with_acceptance(True)
+            actual_model, usage = evidence.actual_model, evidence.usage
+            http_status, request_id = evidence.http_status, evidence.request_id
         _valid_hash(output_hash)
         if not isinstance(actual_model, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/+@-]{0,199}", actual_model) is None:
             raise AgentStorageError("Invalid actual model")
@@ -326,14 +336,21 @@ class AgentRepository(BaseRepository):
             step.decision = "final" if final_result is not None else "tools"
             step.final_result_hash = _hash(final_result) if final_result is not None else None
             session.add_all(pending)
-            ModelRepository._audit(session, task.project_key, task.id, call.id, lease.worker_id, "model_call_succeeded")
+            if evidence is not None:
+                call.outbound_evidence = evidence.model_dump(mode="json")
+                record_outbound_evidence(session, task.project_key, task.id, call.id, lease.worker_id, evidence)
+            record_model_call_settled(session, task.project_key, task.id, call.id, lease.worker_id, "model_call_succeeded")
             self._audit(session, task, lease.worker_id, "agent_turn_accepted", execution.id)
             fence_execution_write(session, lease)
             return [item.to_record() for item in pending]
 
     def reject_call(self, lease, execution_id, step_id, *, error_code, cancelled=False,
-                    actual_model=None, usage=None, http_status=None, request_id=None):
+                    actual_model=None, usage=None, http_status=None, request_id=None, evidence=None):
         """Retain known response Usage even when policy/turn delivery is rejected."""
+        if evidence is not None:
+            evidence = OutboundEvidence.model_validate(evidence)
+            actual_model, usage = evidence.actual_model, evidence.usage
+            http_status, request_id = evidence.http_status, evidence.request_id
         if not isinstance(error_code, str) or re.fullmatch(r"(?:MODEL|TOOL)_[A-Z0-9_]{1,90}", error_code) is None:
             raise AgentStorageError("Invalid call failure code")
         with self._sf.begin() as session:
@@ -354,9 +371,12 @@ class AgentRepository(BaseRepository):
             call.status, call.error_code, call.finish_time = "cancelled" if cancelled else "failed", error_code, now
             step.status, step.error_code, step.finish_time = call.status, "AGENT_CALL_REJECTED_RESULT_UNKNOWN", now
             if is_model:
-                ModelRepository._audit(session, task.project_key, task.id, call.id, lease.worker_id, "model_call_" + call.status)
+                if evidence is not None:
+                    call.outbound_evidence = evidence.model_dump(mode="json")
+                    record_outbound_evidence(session, task.project_key, task.id, call.id, lease.worker_id, evidence)
+                record_model_call_settled(session, task.project_key, task.id, call.id, lease.worker_id, "model_call_" + call.status)
             else:
-                ToolRepository._audit(session, task.project_key, lease.worker_id, "tool_call_" + call.status,
+                record_tool_call_transition(session, task.project_key, lease.worker_id, "tool_call_" + call.status,
                                       task_id=task.id, call_id=call.id)
             fence_execution_write(session, lease, mode=ExecutionWriteMode.SETTLE)
 
@@ -381,6 +401,10 @@ class AgentRepository(BaseRepository):
             binding = session.get(AiPlatformToolBinding, (task.project_key, tool.binding_key))
             if binding is None or not binding.enabled or tool.timeout_seconds > binding.max_timeout_seconds:
                 raise AgentStorageError("Tool binding unavailable")
+            if tool.implementation is not None and (binding.handler_key, binding.handler_version) != (
+                tool.implementation.key, tool.implementation.version,
+            ):
+                raise AgentStorageError("Tool binding does not match its pinned implementation")
             now = session.scalar(text("SELECT clock_timestamp()"))
             call = AiPlatformToolCall(
                 id=uuid4().hex, project_key=task.project_key, task_id=task.id, task_attempt_id=lease.attempt_id,
@@ -392,7 +416,7 @@ class AgentRepository(BaseRepository):
             )
             session.add(call)
             step.status, step.start_time = "running", now
-            ToolRepository._audit(session, task.project_key, lease.worker_id, "tool_call_started",
+            record_tool_call_transition(session, task.project_key, lease.worker_id, "tool_call_started",
                                   task_id=task.id, call_id=call.id, binding_key=binding.key)
             fence_execution_write(session, lease)
             return step.to_record(), call.id
@@ -416,7 +440,7 @@ class AgentRepository(BaseRepository):
             now = session.scalar(text("SELECT clock_timestamp()"))
             call.status, call.output_hash, call.finish_time = "succeeded", _hash(output), now
             step.status, step.output_hash, step.finish_time = "succeeded", call.output_hash, now
-            ToolRepository._audit(session, task.project_key, lease.worker_id, "tool_call_succeeded",
+            record_tool_call_transition(session, task.project_key, lease.worker_id, "tool_call_succeeded",
                                   task_id=task.id, call_id=call.id)
             fence_execution_write(session, lease)
 
@@ -439,3 +463,36 @@ class AgentRepository(BaseRepository):
             execution.status, execution.output_hash, execution.finish_time = "succeeded", _hash(result), now
             self._audit(session, task, lease.worker_id, "agent_execution_succeeded", execution.id)
             fence_execution_write(session, lease)
+
+    def fail(self, lease, execution_id, *, error_code) -> None:
+        """Settle one known Agent failure; never converge the owning Task.
+
+        Active external calls/steps are accounting-unknown and must be settled
+        by their own broker first. Unknown commit outcomes are not retryable.
+        """
+        if not isinstance(error_code, str):
+            raise AgentStorageError("Invalid Agent failure code")
+        normalized = error_code if error_code.startswith("AGENT_") else "AGENT_" + error_code
+        if re.fullmatch(r"AGENT_[A-Z0-9_]{1,90}", normalized) is None:
+            raise AgentStorageError("Invalid Agent failure code")
+        with self._sf.begin() as session:
+            task, execution = self._evidence_scope(session, lease, execution_id, mode=ExecutionWriteMode.SETTLE)
+            steps = self._steps(session, execution)
+            if any(step.status == "running" for step in steps):
+                raise AgentStorageConflict("Agent failure has unsettled step accounting")
+            for entity in (AiPlatformModelCall, AiPlatformToolCall):
+                if session.scalar(select(entity.id).where(
+                    entity.agent_execution_id == execution.id, entity.task_id == task.id,
+                    entity.task_attempt_id == lease.attempt_id, entity.status == "running",
+                ).limit(1)) is not None:
+                    raise AgentStorageConflict("Agent failure has unsettled call accounting")
+            now = session.scalar(text("SELECT clock_timestamp()"))
+            for step in steps:
+                if step.status == "pending":
+                    if step.kind != "tool_call":
+                        raise AgentStorageConflict("Only unstarted Tool intents can be cancelled")
+                    step.status, step.error_code, step.finish_time = "cancelled", "AGENT_NOT_STARTED", now
+            execution.status, execution.error_code, execution.finish_time = "failed", normalized, now
+            execution.output_hash = None
+            self._audit(session, task, lease.worker_id, "agent_execution_failed", execution.id)
+            fence_execution_write(session, lease, mode=ExecutionWriteMode.SETTLE)

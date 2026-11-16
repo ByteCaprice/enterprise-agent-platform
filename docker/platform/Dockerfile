@@ -16,6 +16,7 @@ COPY infra/ infra/
 COPY framework/ framework/
 COPY orchestration/ orchestration/
 COPY interfaces/ interfaces/
+COPY capability_hub/ capability_hub/
 RUN uv sync --locked --no-dev --no-editable
 RUN /opt/platform/bin/enterprise-ai check-release
 

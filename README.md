@@ -8,6 +8,7 @@
 - Project、ServiceIdentity、Key、资源 Grant 与显式 OIDC JWT 绑定。
 - Task/Attempt、幂等接入、数据库租约、取消、结果与执行时间线。
 - Workflow 规则/模型/工具/Agent 节点；受治理的 Pi Agent 执行。
+- 同仓库 `capability_hub/` 可选示例包；固定源码引用的 Python Workflow、自定义处理步骤及共享 Pi Agent。
 - 全局、项目、能力及 Agent 并发准入；预算预留与对账、签名 Callback、评测、业务反馈和受控记忆。
 - 独立 HTTP API、运行健康查询与 Worker；可选的参考控制台。
 
@@ -41,6 +42,9 @@ enterprise-ai worker --config-dir /path/to/platform-config
 | [文档导航](docs/README.md) | 按使用角色选择阅读顺序 |
 | [功能与架构](docs/overview.md) | 核心概念、模块职责与执行边界 |
 | [API 使用](docs/api.md) | 第一个任务、认证、查询与运营接口 |
+| [能力 Hub](docs/capability-hub.md) | 代码目录、Python 混合编排、发布和显式 Worker 安装 |
+| [Skills、MCP 与 Pi](docs/agent-skills-mcp.md) | 静态指引、受治理工具连接和运行配置 |
+| [天气查询示例](docs/weather-query-demo.md) | 可选的多城市外部数据与模型组合示例 |
 | [前端接入契约](docs/frontend-integration.md) | 独立前端的分工、OpenAPI、页面权限与异步交互 |
 | [部署与运维](docs/deployment.md) | 初始化、启动、升级、监控与故障处置 |
 | [开发与仓库规范](docs/development.md) | 代码结构、验证方法与提交规范 |

@@ -73,7 +73,7 @@ class AiResourceGrant(Base):
         ForeignKeyConstraint(["identity_id", "project_key"], ["ai_service_identity.id", "ai_service_identity.project_key"]),
         UniqueConstraint("identity_id", "action", "resource_key", name="uk_ai_resource_grant"),
         CheckConstraint("action IN ('capability:read','capability:write','capability:publish','prompt:render',"
-                        "'task:submit','task:read','task:cancel','model:invoke','tool:invoke','agent:invoke',"
+                        "'task:submit','task:read','task:cancel','model:invoke','tool:invoke','agent:invoke','workflow:invoke',"
                         "'memory:read','memory:write','quality:run','quality:review','skill:use',"
                         "'feedback:read','feedback:write')",
                         name="ck_ai_resource_grant_action"),

@@ -8,6 +8,7 @@ from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
+from domain.outbound_operation import OutboundEvidence
 from domain.platform_agent import ToolAlias
 from domain.platform_model import ModelSecret, ModelUsage
 from domain.task import canonical_json
@@ -148,6 +149,12 @@ class AgentTurnResponse(BaseModel):
     usage: ModelUsage = Field(default_factory=ModelUsage)
     http_status: int = Field(default=200, strict=True, ge=100, le=599)
     request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]{1,200}$")
+
+    @property
+    def evidence(self) -> OutboundEvidence:
+        return OutboundEvidence(dispatch="dispatched", response="received", usage=self.usage,
+                                actual_model=self.actual_model, http_status=self.http_status, request_id=self.request_id,
+                                acceptance="rejected" if self.error_code else "unvalidated")
 
     @model_validator(mode="after")
     def exclusive_outcome(self):

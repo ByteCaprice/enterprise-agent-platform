@@ -23,6 +23,7 @@ from domain.platform_operations import (
     ReviewCreate,
 )
 from domain.task import TaskConflict, TaskError, TaskNotFound, TaskRecord, TaskValidationUnavailable
+from infra.schema_validation import IsolatedJSONValidator
 from interfaces.http.gateway_context import GatewayContext, gateway_response_headers
 from interfaces.http.platform_auth import AdminActor, Principal
 from orchestration.feedback_service import FeedbackService
@@ -67,7 +68,7 @@ def call(operation, *args, **kwargs):
 
 
 def quality(request):
-    return QualityService(request.app.state.store, request.app.state.control_plane_auth)
+    return QualityService(request.app.state.store, request.app.state.control_plane_auth, validator=IsolatedJSONValidator())
 
 
 @router.get("/projects/{project}/tasks/{task_id}/feedback")
@@ -203,7 +204,7 @@ def add_review(request: Request, project: str, task_id: str, spec: ReviewCreate,
              responses={200: {"model": TaskRecord, "description": "Existing recovery Task for an identical request key"}})
 def recover(request: Request, response: Response, project: str, task_id: str, spec: RecoveryCreate,
             principal: Principal, context: GatewayContext):
-    service = GatewayService(request.app.state.store, request.app.state.control_plane_auth)
+    service = GatewayService(request.app.state.store, request.app.state.control_plane_auth, validator=IsolatedJSONValidator())
     admission = call(service.recover, principal, project, task_id, spec.request_key, context=context)
     response.status_code = 202 if admission.request.task_created else 200
     response.headers["Location"] = f"/v2/projects/{project}/tasks/{admission.task.id}"

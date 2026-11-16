@@ -2,13 +2,13 @@ import hashlib
 import json
 from datetime import UTC, datetime
 
-from domain.capability import CapabilityVersionDraft
+from domain.capability import CapabilityDependency, CapabilityVersionDraft
 from domain.task import TaskRecord, TaskStatus
 from framework.workflow_recovery import assess_workflow_recovery
 
 
-def _draft(definition):
-    return CapabilityVersionDraft(version="1", definition=definition)
+def _draft(definition, *, dependencies=()):
+    return CapabilityVersionDraft(version="1", definition=definition, dependencies=list(dependencies))
 
 
 def _source(draft, *, kind="workflow", status=TaskStatus.FAILED):
@@ -42,7 +42,10 @@ def test_pure_rule_workflow_is_assessed_as_new_task_only():
 
 
 def test_agent_workflow_or_hash_mismatch_is_closed():
-    draft = _draft({"nodes": [{"key": "agent", "kind": "agent", "capability": {"key": "agent", "version": "1"}}]})
+    draft = _draft(
+        {"nodes": [{"key": "agent", "kind": "agent", "capability": {"key": "agent", "version": "1"}}]},
+        dependencies=(CapabilityDependency(key="agent", version="1"),),
+    )
     source, digest = _source(draft)
 
     unsupported = assess_workflow_recovery(source, draft, digest)

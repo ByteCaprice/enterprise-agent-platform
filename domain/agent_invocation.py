@@ -7,15 +7,25 @@ from dataclasses import dataclass, field, replace
 
 from domain.capability import CapabilityDependency, CapabilityVersionRecord
 from domain.task_execution import TaskClaim
+from domain.workflow_invocation import WorkflowInvocation
 
 
 @dataclass(frozen=True)
 class AgentInvocation:
-    root: TaskClaim = field(repr=False)
+    root: TaskClaim | WorkflowInvocation = field(repr=False)
     reference: CapabilityDependency
     artifact: CapabilityVersionRecord = field(repr=False)
     input: dict = field(repr=False)
     parent_node_id: str | None = None
+    delegated_workflows: tuple[CapabilityDependency, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "input", deepcopy(self.input))
+        if isinstance(self.root, WorkflowInvocation):
+            inherited = self.root.delegated_workflows
+            if self.delegated_workflows and self.delegated_workflows != inherited:
+                raise ValueError("Agent cannot replace its inherited Workflow delegation")
+            object.__setattr__(self, "delegated_workflows", inherited)
 
     @property
     def task(self):

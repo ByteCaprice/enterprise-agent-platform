@@ -9,14 +9,16 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from test_platform_tasks import ADMIN, service_identity, submit
 from test_platform_tasks import inbox as inbox_fixture
+from worker_support import model_gateway
 
 from domain.capability import CapabilityDependency, CapabilitySpec, CapabilityVersionDraft
+from domain.capability_definitions import WORKFLOW_CHECKPOINT_PROFILE, WORKFLOW_INTERPRETER_PROFILE
 from domain.platform_model import ModelMessage, ModelMessages, ModelTransportFailure, ModelTransportResponse, ModelUsage
 from domain.task_execution import ExecutionFailure
 from infra.model_credentials import EnvironmentCredentialResolver, credential_variable_name
+from infra.schema_validation import IsolatedJSONValidator
 from interfaces.worker.platform import run_workflow_worker
 from orchestration.capability_service import CapabilityService
-from orchestration.platform_model_gateway import PlatformModelGateway
 
 inbox = inbox_fixture
 PROVIDERS = "/v2/projects/payments/model-providers"
@@ -54,7 +56,7 @@ def setup_model(client, store, monkeypatch, *, fallback=False, prompt=True):
     })
     assert response.status_code == 201
     monkeypatch.setenv(credential_variable_name("payments", "mock-key"), "synthetic-provider-secret")
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
 
     def publish(key, kind, definition, **kwargs):
         service.create("payments", CapabilitySpec(key=key, kind=kind, name=key), "task-admin")
@@ -96,7 +98,7 @@ def grant(client, identity, action, resource):
 
 
 def execute(store, transport):
-    gateway = PlatformModelGateway(store, transport, EnvironmentCredentialResolver())
+    gateway = model_gateway(store, transport, EnvironmentCredentialResolver())
     return asyncio.run(run_workflow_worker(store, once=True, gateway=gateway))
 
 
@@ -159,7 +161,12 @@ def test_fallback_records_each_candidate_but_never_replays_timeout(inbox, monkey
     client, store = inbox
     setup_model(client, store, monkeypatch, fallback=True, prompt=False)
     target = submit(client, capability_key="model-flow").headers["Location"]
-    transport = MockModel(failure=ModelTransportFailure(code, retryable=retryable))
+    from domain.outbound_operation import OutboundEvidence
+
+    evidence = (OutboundEvidence(dispatch="dispatched", response="received", acceptance="rejected", http_status=429,
+                                 retry_permission="safe_response") if code == "MODEL_UPSTREAM_UNAVAILABLE" else
+                OutboundEvidence())
+    transport = MockModel(failure=ModelTransportFailure(code, evidence=evidence, retryable=retryable))
     assert execute(store, transport)
     assert len(transport.requests) == count
     calls = client.get(target + "/model-calls", headers=ADMIN).json()
@@ -189,10 +196,14 @@ def test_call_cannot_be_replayed_and_database_terminal_nulls_are_rejected(inbox,
     client, store = inbox
     setup_model(client, store, monkeypatch, prompt=False)
     submit(client, capability_key="model-flow")
-    claim = store.tasks.claim("model-ledger-worker", kinds=("workflow",), lease_seconds=60)
-    checkpoint = store.workflows.begin(claim.lease, "llm", "a" * 64)
+    from worker_support import worker_capabilities
+
+    claim = store.task_queue.claim("model-ledger-worker", capabilities=worker_capabilities("workflow"), lease_seconds=60)
+    checkpoint = store.workflows.begin(claim.lease, "llm", "a" * 64,
+                                       interpreter_profile=WORKFLOW_INTERPRETER_PROFILE,
+                                       checkpoint_profile=WORKFLOW_CHECKPOINT_PROFILE)
     transport = MockModel()
-    gateway = PlatformModelGateway(store, transport, EnvironmentCredentialResolver())
+    gateway = model_gateway(store, transport, EnvironmentCredentialResolver())
     messages = ModelMessages(messages=[ModelMessage(role="user", content="Synthetic request")])
     reference = CapabilityDependency(key="policy", version="1")
     assert asyncio.run(gateway.complete(claim, checkpoint.record.id, reference, messages)) == {"answer": "synthetic-approved"}
@@ -233,7 +244,7 @@ def test_late_model_response_cannot_finish_after_lease_loss(inbox, monkeypatch):
     transport = MockModel(after=lose_lease)
     assert execute(store, transport) and len(transport.requests) == 1
     assert client.get(accepted.headers["Location"], headers=ADMIN).json()["status"] == "running"
-    assert store.tasks.recover_expired() == 1
+    assert store.task_queue.recover_expired() == 1
     result = client.get(accepted.headers["Location"] + "/result", headers=ADMIN).json()
     assert result["status"] == "failed" and result["result"] is None
     call = client.get(accepted.headers["Location"] + "/model-calls", headers=ADMIN).json()[0]

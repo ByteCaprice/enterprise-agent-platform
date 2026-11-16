@@ -11,9 +11,9 @@ from domain.capability import (
     CapabilityVersionRecord,
     ModelPolicyDefinition,
 )
+from domain.execution_ports import ExecutionResources, ModelProviderReader
 from domain.platform_model import ModelProviderRecord
 from domain.task_execution import ExecutionFailure, TaskClaim
-from orchestration.execution_authorization import ExecutionAuthorizer
 from orchestration.published_capabilities import PublishedCapabilities
 
 
@@ -37,10 +37,11 @@ _Policy = TypeVar("_Policy", ModelPolicyDefinition, AgentTurnPolicyDefinition)
 class ModelPolicyResolver:
     """Live access, pinned policies and installed Provider/catalog constraints."""
 
-    def __init__(self, store):
-        self.store = store
-        self.authorizer = ExecutionAuthorizer(store)
-        self.catalog = PublishedCapabilities(store.capabilities)
+    def __init__(self, resources: ExecutionResources, providers: ModelProviderReader):
+        self.resources = resources
+        self.providers = providers
+        self.authorizer = resources.authorization
+        self.catalog = PublishedCapabilities(resources.capabilities)
 
     def _authorize(self, claim, policy_key, prompt=None):
         if not (self.authorizer.allowed(claim) and self.authorizer.allowed_resource(claim, "model:invoke", policy_key)):
@@ -64,7 +65,7 @@ class ModelPolicyResolver:
             self._authorize(claim, reference.key, prompt)
             artifact = self.catalog.resolve(claim.task.project_key, reference, CapabilityKind.MODEL_POLICY)
             policy = policy_type.model_validate(artifact.definition)
-            provider = self.store.models.provider(claim.task.project_key, policy.provider_key)
+            provider = self.providers.provider(claim.task.project_key, policy.provider_key)
             if not provider.enabled:
                 raise ExecutionFailure("MODEL_PROVIDER_DISABLED")
             candidates = [policy.model, *(policy.fallback_models if isinstance(policy, ModelPolicyDefinition) else [])]

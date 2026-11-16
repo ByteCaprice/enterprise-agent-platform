@@ -11,7 +11,8 @@ from dataclasses import replace
 import pytest
 from sqlalchemy import text
 from test_platform_tasks import inbox as inbox_fixture
-from test_platform_tasks import submit
+from test_platform_tasks import publish_completion_flow, record_completion_node, submit
+from worker_support import worker_capabilities, worker_services
 
 from domain.task_control import ControlState, ExecutionObservation
 from domain.task_execution import CompletionOutcome
@@ -44,7 +45,8 @@ def test_repeated_worker_cancellation_never_releases_worker_while_adapter_runs(i
                 stopped.set()
             return {"done": True}
 
-        worker = PlatformWorker(store, "cancellation-test", {"agent": execute}, policy=policy)
+        worker = PlatformWorker(worker_services(store), "cancellation-test", {"agent": execute}, policy=policy,
+                                capabilities=worker_capabilities("agent"))
         running = asyncio.create_task(worker.run_once())
         try:
             await asyncio.wait_for(started.wait(), 5)
@@ -70,25 +72,29 @@ def test_claim_skips_locked_oldest_task(inbox):
     with store.engine.begin() as connection:
         connection.execute(text("SELECT id FROM ai_task WHERE id = :id FOR UPDATE"), {"id": first})
         with ThreadPoolExecutor(max_workers=1) as pool:
-            claim = pool.submit(store.tasks.claim, "other-worker").result(timeout=5)
+            claim = pool.submit(store.task_queue.claim, "other-worker", capabilities=worker_capabilities()).result(timeout=5)
         assert claim is not None and claim.task.id == second
-    assert store.tasks.claim("next-worker").task.id == first
+    assert store.task_queue.claim("next-worker", capabilities=worker_capabilities()).task.id == first
 
 
 def test_each_lease_identity_component_fences_heartbeat_and_completion(inbox):
     client, store = inbox
-    first = submit(client, key="first-fence").json()["id"]
-    second = submit(client, key="second-fence").json()["id"]
-    one, two = store.tasks.claim("worker"), store.tasks.claim("worker")
+    publish_completion_flow(store)
+    first = submit(client, key="first-fence", capability_key="completion-flow").json()["id"]
+    second = submit(client, key="second-fence", capability_key="completion-flow").json()["id"]
+    one = store.task_queue.claim("worker", capabilities=worker_capabilities())
+    two = store.task_queue.claim("worker", capabilities=worker_capabilities())
     assert {one.task.id, two.task.id} == {first, second}
     for forged in (replace(one.lease, task_id=two.lease.task_id),
                    replace(one.lease, attempt_id=two.lease.attempt_id),
                    replace(one.lease, worker_id="different"),
                    replace(one.lease, token=two.lease.token)):
-        assert not store.tasks.heartbeat(forged)
-        assert store.tasks.complete(forged, status="failed", error_code="SAFE_ERROR") == CompletionOutcome.LEASE_LOST
-    assert store.tasks.complete(one.lease, status="succeeded", result={"ok": True}) == CompletionOutcome.COMPLETED
-    assert store.tasks.complete(two.lease, status="succeeded", result={"ok": True}) == CompletionOutcome.COMPLETED
+        assert not store.task_queue.heartbeat(forged)
+        assert store.task_completion.complete(forged, status="failed", error_code="SAFE_ERROR") == CompletionOutcome.LEASE_LOST
+    record_completion_node(store, one, {"ok": True})
+    record_completion_node(store, two, {"ok": True})
+    assert store.task_completion.complete(one.lease, status="succeeded", result={"ok": True}) == CompletionOutcome.COMPLETED
+    assert store.task_completion.complete(two.lease, status="succeeded", result={"ok": True}) == CompletionOutcome.COMPLETED
 
 
 def test_heartbeat_exception_cancels_adapter_without_terminal_write(inbox, monkeypatch):
@@ -116,7 +122,8 @@ def test_heartbeat_exception_cancels_adapter_without_terminal_write(inbox, monke
     monkeypatch.setattr(store.task_control, "observe", fail_on_second)
     policy = WorkerPolicy(lease_seconds=10, heartbeat_seconds=0.1, execution_timeout_seconds=5,
                           cancellation_grace_seconds=1)
-    assert asyncio.run(PlatformWorker(store, "worker", {"agent": execute}, policy=policy).run_once())
+    assert asyncio.run(PlatformWorker(worker_services(store), "worker", {"agent": execute}, policy=policy,
+                                     capabilities=worker_capabilities("agent")).run_once())
     assert stopped == [True] and calls == 2
     result = store.tasks.result("payments", task_id, allowed_keys={"*"}, owner=None)
     assert result.status == "running" and result.result is None and result.error_code is None
@@ -125,7 +132,7 @@ def test_heartbeat_exception_cancels_adapter_without_terminal_write(inbox, monke
 def test_expired_lease_before_dispatch_never_invokes_adapter(inbox, monkeypatch):
     client, store = inbox
     task_id = submit(client).json()["id"]
-    original_claim = store.tasks.claim
+    original_claim = store.task_queue.claim
 
     def expire_after_claim(*args, **kwargs):
         claim = original_claim(*args, **kwargs)
@@ -134,16 +141,17 @@ def test_expired_lease_before_dispatch_never_invokes_adapter(inbox, monkeypatch)
                                {"id": claim.lease.attempt_id})
         return claim
 
-    monkeypatch.setattr(store.tasks, "claim", expire_after_claim)
+    monkeypatch.setattr(store.task_queue, "claim", expire_after_claim)
     called = []
 
     async def execute(_claim):
         called.append(True)
         return {}
 
-    assert asyncio.run(PlatformWorker(store, "worker", {"agent": execute}).run_once())
+    assert asyncio.run(PlatformWorker(worker_services(store), "worker", {"agent": execute},
+                                     capabilities=worker_capabilities("agent")).run_once())
     assert not called
-    assert store.tasks.recover_expired() == 1
+    assert store.task_queue.recover_expired() == 1
     result = store.tasks.result("payments", task_id, allowed_keys={"*"}, owner=None)
     assert result.status == "failed" and result.error_code == "LEASE_EXPIRED_RESULT_UNKNOWN"
 
@@ -178,7 +186,8 @@ def test_hanging_heartbeat_stops_execution_within_lease(inbox, monkeypatch, _ite
     policy = WorkerPolicy(lease_seconds=3, heartbeat_seconds=0.05, execution_timeout_seconds=10,
                           cancellation_grace_seconds=0.2)
 
-    worker = PlatformWorker(store, "worker", {"agent": execute}, policy=policy)
+    worker = PlatformWorker(worker_services(store), "worker", {"agent": execute}, policy=policy,
+                            capabilities=worker_capabilities("agent"))
     # Isolate monitor timing from SIT latency; the preceding test exercises the real pre-dispatch fence.
     monkeypatch.setattr(worker.authorizer, "allowed", lambda _claim: True)
 

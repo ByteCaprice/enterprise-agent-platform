@@ -53,32 +53,42 @@ def budget_used(session, project, budget):
         AiBudgetCharge.reserved_microunits)), 0)).where(AiBudgetCharge.project_key == project, AiBudgetCharge.budget_key == budget))
 
 
-def account_model_call(session, call_id, event):
-    """Called inside the same fenced transaction as the model ledger write."""
+def _locked_model_call(session, call_id):
+    """Use the caller's fenced transaction and serialize project budget changes."""
     session.flush()
     call = session.get(AiPlatformModelCall, call_id)
     if call is None:
         raise ValueError("Model accounting requires an existing call")
     # Identity/project revocation must not prevent settlement of an existing charge.
     session.scalar(select(AiProject.key).where(AiProject.key == call.project_key).with_for_update())
+    return call
+
+
+def reserve_model_call_budget(session, call_id):
+    """Reserve declared money for an admitted call, without audit or journal effects."""
+    call = _locked_model_call(session, call_id)
+    limits = session.get(AiProjectLimits, call.project_key)
+    if limits is None or limits.active_budget_key is None:
+        return
+    budget = session.get(AiBudgetCycle, (call.project_key, limits.active_budget_key))
+    now = session.scalar(select(func.clock_timestamp()))
+    if budget is None or not budget.starts_at <= now < budget.ends_at:
+        raise ExecutionFailure("MODEL_BUDGET_UNAVAILABLE")
+    rate = next((r for r in budget.rates if r["provider_key"] == call.provider_key and r["model"] == call.requested_model), None)
+    if rate is None:
+        raise ExecutionFailure("MODEL_BUDGET_PRICE_UNAVAILABLE")
+    if budget_used(session, call.project_key, budget.key) + budget.reserve_per_call_microunits > budget.limit_microunits:
+        raise ExecutionFailure("MODEL_BUDGET_EXHAUSTED")
+    session.add(AiBudgetCharge(call_id=call.id, project_key=call.project_key, budget_key=budget.key,
+                               task_id=call.task_id, reserved_microunits=budget.reserve_per_call_microunits,
+                               settled_microunits=None, state="reserved"))
+
+
+def settle_model_call_budget(session, call_id):
+    """Settle retained Usage even after cancellation/revocation; never invent zero usage."""
+    call = _locked_model_call(session, call_id)
     charge = session.get(AiBudgetCharge, call_id)
-    if event == "model_call_started":
-        limits = session.get(AiProjectLimits, call.project_key)
-        if limits is None or limits.active_budget_key is None:
-            return
-        budget = session.get(AiBudgetCycle, (call.project_key, limits.active_budget_key))
-        now = session.scalar(select(func.clock_timestamp()))
-        if budget is None or not budget.starts_at <= now < budget.ends_at:
-            raise ExecutionFailure("MODEL_BUDGET_UNAVAILABLE")
-        rate = next((r for r in budget.rates if r["provider_key"] == call.provider_key and r["model"] == call.requested_model), None)
-        if rate is None:
-            raise ExecutionFailure("MODEL_BUDGET_PRICE_UNAVAILABLE")
-        if budget_used(session, call.project_key, budget.key) + budget.reserve_per_call_microunits > budget.limit_microunits:
-            raise ExecutionFailure("MODEL_BUDGET_EXHAUSTED")
-        session.add(AiBudgetCharge(call_id=call.id, project_key=call.project_key, budget_key=budget.key,
-                                   task_id=call.task_id, reserved_microunits=budget.reserve_per_call_microunits,
-                                   settled_microunits=None, state="reserved"))
-    elif charge is not None and charge.state == "reserved":
+    if charge is not None and charge.state == "reserved":
         budget = session.get(AiBudgetCycle, (call.project_key, charge.budget_key))
         rate = next((r for r in budget.rates if r["provider_key"] == call.provider_key and r["model"] == call.requested_model), None)
         if rate is not None and call.prompt_tokens is not None and call.completion_tokens is not None:
@@ -92,3 +102,11 @@ def account_model_call(session, call_id, event):
                 charge.state = "unknown"
         else:
             charge.state = "unknown"  # retains reservation; never invent zero usage
+
+
+def close_task_budget_reservations(session, task_id):
+    """Close unsettled calls as unknown on terminal Task transition, not callback delivery."""
+    for charge in session.scalars(select(AiBudgetCharge).where(
+        AiBudgetCharge.task_id == task_id, AiBudgetCharge.state == "reserved",
+    )):
+        charge.state = "unknown"

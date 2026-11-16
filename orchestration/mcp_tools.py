@@ -1,7 +1,5 @@
 """Install exact, project-bound MCP pins into the existing read-only Tool Gateway."""
 
-import asyncio
-
 from domain.platform_mcp import MCPCatalog, MCPConnection, MCPToolPin
 from domain.platform_tool import InstalledReadonlyTool
 from domain.schema_validation import JSONValidationUnavailable
@@ -10,6 +8,7 @@ from domain.task_execution import ExecutionFailure
 from framework.readonly_tools import ReadonlyToolRegistry, builtin_readonly_tools
 from infra.mcp_http import MCPJSONTransport
 from infra.schema_validation import validate_json
+from orchestration.execution_async import run_sync
 
 
 def _installed_tool(connection, pin, transport):
@@ -24,7 +23,7 @@ def _installed_tool(connection, pin, transport):
             raise ExecutionFailure("TOOL_MCP_PROJECT_DENIED")
         try:
             canonical_json(values)
-            await asyncio.to_thread(validate_json, values, approved.input_schema)
+            await run_sync(validate_json, values, approved.input_schema)
         except JSONValidationUnavailable:
             raise ExecutionFailure("TOOL_VALIDATION_UNAVAILABLE") from None
         except Exception:
@@ -33,19 +32,26 @@ def _installed_tool(connection, pin, transport):
             await session.initialize()
             remote = next((tool for tool in await session.tools() if tool["name"] == approved.remote_tool), None)
             if (remote is None or canonical_json(remote.get("inputSchema")) != canonical_json(approved.input_schema) or
-                    canonical_json(remote.get("outputSchema")) != canonical_json(approved.output_schema) or
+                    ("outputSchema" in remote if approved.result_mode == "text" else
+                     canonical_json(remote.get("outputSchema")) != canonical_json(approved.output_schema)) or
                     (isinstance(remote.get("execution"), dict) and remote["execution"].get("taskSupport") == "required")):
                 raise ExecutionFailure("TOOL_MCP_SCHEMA_CHANGED")
             result = await session.call(approved.remote_tool, values)
             output = result.get("structuredContent")
             content = result.get("content")
-            if (result.get("isError", False) is not False or not isinstance(output, dict) or
+            if (result.get("isError", False) is not False or
                     not isinstance(content, list) or any(not isinstance(item, dict) or item.get("type") != "text"
                                                         or not isinstance(item.get("text"), str) for item in content)):
                 raise ExecutionFailure("TOOL_MCP_OUTPUT_REJECTED")
+            if approved.result_mode == "text":
+                if not content or output is not None:
+                    raise ExecutionFailure("TOOL_MCP_OUTPUT_REJECTED")
+                output = {"text": "\n".join(item["text"] for item in content)}
+            elif not isinstance(output, dict):
+                raise ExecutionFailure("TOOL_MCP_OUTPUT_REJECTED")
             try:
                 canonical_json(output)
-                await asyncio.to_thread(validate_json, output, approved.output_schema)
+                await run_sync(validate_json, output, approved.output_schema)
             except JSONValidationUnavailable:
                 raise ExecutionFailure("TOOL_VALIDATION_UNAVAILABLE") from None
             except Exception:

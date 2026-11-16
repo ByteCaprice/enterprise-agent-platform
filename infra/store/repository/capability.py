@@ -16,6 +16,7 @@ from domain.capability import (
     CapabilityVersionDraft,
     CapabilityVersionRecord,
 )
+from domain.capability_publication import PublicationEvidence
 from infra.store.model import AiCapability, AiCapabilityVersion, AiRunLog
 from infra.store.repository.base import BaseRepository
 
@@ -32,12 +33,12 @@ class CapabilityRepository(BaseRepository):
         return row
 
     @staticmethod
-    def _version(session, capability_id, version, *, lock=False):
+    def _version(session, capability_id, version, *, lock=False, shared=False):
         query = select(AiCapabilityVersion).where(
             AiCapabilityVersion.capability_id == capability_id, AiCapabilityVersion.version == version
         )
-        if lock:
-            query = query.with_for_update()
+        if lock or shared:
+            query = query.with_for_update(read=shared)
         row = session.scalar(query)
         if row is None:
             raise CapabilityNotFound("Capability version not found")
@@ -107,28 +108,49 @@ class CapabilityRepository(BaseRepository):
                                    .order_by(AiCapabilityVersion.create_time.desc()).limit(limit)).all()
             return [row.to_domain() for row in rows]
 
-    def publish(self, project_key: str, key: str, version: str, actor: str) -> CapabilityVersionRecord:
+    def publish(self, project_key: str, key: str, version: str, actor: str, *,
+                evidence: PublicationEvidence) -> CapabilityVersionRecord:
         with self._sf.begin() as session:
             capability = self._identity(session, project_key, key, lock=True)
             row = self._version(session, capability.id, version, lock=True)
+            artifact = row.to_domain()
+            artifact.verify_integrity()
+            if (capability.id, capability.kind, row.version, row.content_hash) != (
+                evidence.capability_id, evidence.kind, evidence.version, evidence.content_hash,
+            ):
+                raise CapabilityConflict("Validated publication artifact changed")
             if row.status == "published":
                 return row.to_domain()
             if row.status != "draft":
                 raise CapabilityConflict("Only draft versions can be published")
-            for dependency in row.dependencies:
-                if dependency["key"] == key:
+            validated = {(item.key, item.version): item for item in evidence.dependencies}
+            declared = {(item["key"], item["version"]) for item in row.dependencies}
+            if declared != set(validated) or len(evidence.dependencies) != len(row.dependencies):
+                raise CapabilityConflict("Validated publication dependencies changed")
+            # Stable lock order for shared dependencies across concurrent publishers.
+            for reference in sorted(declared):
+                proof = validated[reference]
+                if proof.key == key:
                     raise CapabilityConflict("A capability cannot depend on itself")
-                target = self._identity(session, project_key, dependency["key"])
-                target_version = self._version(session, target.id, dependency["version"])
-                if target_version.status != "published":
-                    raise CapabilityConflict("All dependencies must reference published versions")
+                target = self._identity(session, project_key, proof.key)
+                # Published dependencies are read-only. Exclusive locks here
+                # can deadlock with a claimant traversing the same graph in a
+                # different order; shared locks retain the evidence through commit.
+                target_version = self._version(session, target.id, proof.version, shared=True)
+                if (target.id, target.kind) != (proof.capability_id, proof.kind):
+                    raise CapabilityConflict("Validated publication dependency changed")
+                target_version.to_domain().require_published(
+                    capability_id=proof.capability_id, version=proof.version, content_hash=proof.content_hash,
+                )
             row.status = "published"
             row.published_by = actor
             row.publish_time = utc_now()
             if capability.default_version is None:
                 capability.default_version = version
             self._audit(session, capability.id, actor, "capability_published",
-                        version=version, content_hash=row.content_hash)
+                        version=version, content_hash=row.content_hash, interpreter_profile=evidence.interpreter_profile,
+                        dependencies=[{"key": item.key, "version": item.version, "content_hash": item.content_hash}
+                                      for item in evidence.dependencies])
             session.flush()
             return row.to_domain()
 
@@ -136,8 +158,7 @@ class CapabilityRepository(BaseRepository):
         with self._sf.begin() as session:
             capability = self._identity(session, project_key, key, lock=True)
             row = self._version(session, capability.id, version)
-            if row.status != "published":
-                raise CapabilityConflict("Default version must be published")
+            row.to_domain().require_published(capability_id=capability.id, version=version)
             previous = capability.default_version
             capability.default_version = version
             self._audit(session, capability.id, actor, "capability_default_changed", previous=previous, version=version)

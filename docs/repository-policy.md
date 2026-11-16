@@ -24,7 +24,7 @@
 公开 Markdown 列表由 `scripts/repository_policy.py` 维护，`.gitignore` 只放行对应路径：
 
 - 根 `README.md`、`CONTRIBUTING.md`。
-- `docs/README.md`、`overview.md`、`api.md`、`frontend-integration.md`、`deployment.md`、`development.md`、`roadmap.md`、`repository-policy.md`。
+- `docs/README.md`、`overview.md`、`api.md`、`frontend-integration.md`、`deployment.md`、`development.md`、`capability-hub.md`、`weather-query-demo.md`、`agent-skills-mcp.md`、`roadmap.md`、`repository-policy.md`。
 - `tests/fixtures/trade_documents/README.md` 仅说明样本分发限制；不包含或授权分发样本。
 
 内部资料统一优先放在 `.local/`。原本被忽略的需求基线和环境配置可继续保留原位置，不要求移动或删除；公开文档不得依赖这些文件的链接才能阅读。
@@ -48,6 +48,8 @@
 | Python 发行物 | 包发现排除、`MANIFEST.in`、wheel 内容检查 | 不能假设本地文件未提交就不会被打包 |
 
 分发边界与代码依赖须同时成立：源码、测试和文档不能依赖被忽略的本地模块。新增组件时，应一并审查运行依赖、测试入口、材料来源和发布资产。
+
+`capability_hub/` 是明确允许的通用能力及可选示例源码根目录，不是私有材料豁免区。规则、Prompt 和工具代码仍须逐项内容审核；真实客户样本、私有环境端点、凭据和未获分发授权的政策不得随能力包提交。新 JSON/YAML/Markdown 资产仍需单独放行。
 
 ## 公开发布
 

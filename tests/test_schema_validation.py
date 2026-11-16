@@ -13,6 +13,7 @@ from domain.capability import CapabilityError, CapabilityValidationUnavailable
 from domain.schema_validation import JSONValidationError, JSONValidationUnavailable
 from domain.task import TaskError, TaskValidationUnavailable
 from domain.task_execution import CompletionOutcome
+from domain.task_worker import WorkerServices
 from infra import schema_validation as validator
 from interfaces.http.routes import capabilities, platform_operations, tasks
 from orchestration.platform_worker import PlatformWorker
@@ -157,6 +158,8 @@ def test_http_unavailability_is_503_not_invalid_422():
 
 
 def test_final_schema_unavailability_settles_failure_without_reexecuting():
+    from worker_support import worker_capabilities
+
     calls = []
 
     def complete(lease, **kwargs):
@@ -168,8 +171,12 @@ def test_final_schema_unavailability_settles_failure_without_reexecuting():
     async def executor(claim) -> dict:
         raise AssertionError("Finalization must never repeat execution")
 
-    store = SimpleNamespace(tasks=SimpleNamespace(complete=complete))
-    worker = PlatformWorker(store, "worker", {"workflow": executor})
+    services = WorkerServices(
+        queue=SimpleNamespace(), control=SimpleNamespace(), completion=SimpleNamespace(complete=complete),
+        authorization=SimpleNamespace(allowed=lambda _: True), validation=validator.IsolatedJSONValidator(),
+    )
+    worker = PlatformWorker(services, "worker", {"workflow": executor},
+                            capabilities=worker_capabilities("workflow"))
     claim = SimpleNamespace(lease="same-live-fence")
     asyncio.run(worker._finalize(claim, None, status="succeeded", result={"result": "private"}))
     assert [call[0] for call in calls] == ["same-live-fence", "same-live-fence"]

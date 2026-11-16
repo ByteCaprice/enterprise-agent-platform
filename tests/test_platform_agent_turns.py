@@ -10,9 +10,9 @@ from pydantic import ValidationError
 
 from domain.agent_turn import AgentConversation, AgentToolDescriptor, AgentTurnRequest
 from domain.capability import AgentTurnPolicyDefinition, CapabilityKind, CapabilityVersionDraft, ModelPolicyDefinition
+from domain.capability_definitions import interpret_definition
 from domain.platform_model import ModelSecret, ModelTransportFailure
 from infra.agent_turn_http import AgentTurnHTTPTransport
-from orchestration.capability_service import CapabilityService
 
 
 def response(*, invalid=False):
@@ -35,11 +35,11 @@ def test_agent_mode_is_explicit_and_does_not_weaken_completion_policy():
     with pytest.raises(ValidationError):
         AgentTurnPolicyDefinition.model_validate({**policy, "interaction": "agent_turn", "request_profile": "arbitrary"})
     with pytest.raises(ValidationError):
-        CapabilityService._validate_definition(CapabilityKind.AGENT, CapabilityVersionDraft(
+        interpret_definition(CapabilityKind.AGENT, CapabilityVersionDraft(
             version="1", definition={"definition_version": "agent.future", "name": "prototype", "route_tags": []},
         ))
     with pytest.raises(ValidationError):
-        CapabilityService._validate_definition(CapabilityKind.AGENT, CapabilityVersionDraft(
+        interpret_definition(CapabilityKind.AGENT, CapabilityVersionDraft(
             version="1", definition={"name": "old-agent", "version": "1", "route_tags": []},
         ))
 

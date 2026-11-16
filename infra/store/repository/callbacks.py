@@ -12,15 +12,13 @@ from sqlalchemy import func, or_, select, text, tuple_
 
 from domain.callback_delivery import CallbackDeliveryPage, CallbackDeliveryView
 from domain.task import TaskConflict, TaskError, TaskNotFound, canonical_json
+from domain.task_event import TERMINAL_TASK_EVENTS
 from infra.store.model import AiProject, AiTask
-from infra.store.model.ai_operations import AiBudgetCharge, AiCallbackDelivery, AiCallbackEndpoint
+from infra.store.model.ai_operations import AiCallbackDelivery, AiCallbackEndpoint
 from infra.store.repository.base import BaseRepository
 from infra.store.repository.execution_queries import ExecutionQueryRepository
 from infra.store.repository.limits import project_lock
 from infra.store.repository.operations import audit, record
-
-TERMINAL_EVENTS = {"task_succeeded", "task_failed", "task_timed_out", "task_cancelled",
-                    "task_lease_expired", "task_cancel_unconfirmed"}
 
 
 class _DeliveryCursor(BaseModel):
@@ -47,15 +45,12 @@ def _delivery_cursor(value, scope):
         raise TaskError("Invalid callback delivery cursor") from None
 
 
-def terminal_outbox(session, task_id, sequence, event):
-    if event not in TERMINAL_EVENTS:
+def enqueue_terminal_callbacks(session, task_id, sequence, event):
+    """Enqueue metadata-only delivery in the caller's transaction; never account usage."""
+    if event not in TERMINAL_TASK_EVENTS:
         return
     task = session.get(AiTask, task_id)
     now = session.scalar(select(func.clock_timestamp()))
-    # Failed/expired executions may have converged calls without individual settlement callbacks.
-    for charge in session.scalars(select(AiBudgetCharge).where(AiBudgetCharge.task_id == task_id,
-                                                              AiBudgetCharge.state == "reserved")):
-        charge.state = "unknown"
     for endpoint in session.scalars(select(AiCallbackEndpoint).where(AiCallbackEndpoint.project_key == task.project_key,
                                                                     AiCallbackEndpoint.enabled.is_(True))):
         delivery_id = uuid4().hex

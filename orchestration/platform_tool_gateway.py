@@ -11,14 +11,20 @@ from dataclasses import dataclass
 from domain.agent_invocation import AgentInvocation
 from domain.capability import CapabilityDependency, CapabilityKind, CapabilityVersionRecord
 from domain.execution_context import ExecutionDeadlineExceeded
+from domain.execution_ports import AgentToolLedger, ExecutionResources, ToolCallLedger
 from domain.platform_agent import AgentStorageConflict, AgentStorageError, AgentValidationUnavailable
 from domain.platform_tool import ToolBindingRecord, ToolConfigurationError, ToolConflict, ToolContext, ToolDefinition
 from domain.schema_validation import JSONValidationUnavailable
 from domain.task import canonical_json
-from domain.task_execution import ExecutionFailure, TaskCancellationRequested, TaskClaim, TaskLeaseLost
+from domain.task_execution import (
+    ExecutionFailure,
+    ExecutionResourceUnstoppable,
+    TaskCancellationRequested,
+    TaskClaim,
+    TaskLeaseLost,
+)
 from framework.readonly_tools import ReadonlyToolRegistry
-from infra.schema_validation import validate_json
-from orchestration.execution_authorization import ExecutionAuthorizer
+from orchestration.execution_async import accounting_error, run_sync
 from orchestration.published_capabilities import PublishedCapabilities
 
 
@@ -30,11 +36,14 @@ class ResolvedTool:
 
 
 class PlatformToolGateway:
-    def __init__(self, store, registry: ReadonlyToolRegistry):
-        self.store = store
+    def __init__(self, resources: ExecutionResources, calls: ToolCallLedger,
+                 agent_calls: AgentToolLedger, registry: ReadonlyToolRegistry):
+        self.resources = resources
+        self.calls = calls
+        self.agent_calls = agent_calls
         self.registry = registry
-        self.authorizer = ExecutionAuthorizer(store)
-        self.catalog = PublishedCapabilities(store.capabilities)
+        self.authorizer = resources.authorization
+        self.catalog = PublishedCapabilities(resources.capabilities)
 
     def resolve(self, claim: TaskClaim | AgentInvocation, reference: CapabilityDependency) -> ResolvedTool:
         try:
@@ -46,26 +55,31 @@ class PlatformToolGateway:
                 raise ExecutionFailure("TOOL_AGENT_ACCESS_DENIED")
             artifact = self.catalog.resolve(claim.task.project_key, reference, CapabilityKind.TOOL)
             definition = ToolDefinition.model_validate(artifact.definition)
-            binding = self.store.tool_bindings.binding(claim.task.project_key, definition.binding_key)
+            binding = self.calls.binding(claim.task.project_key, definition.binding_key)
             if not binding.enabled:
                 raise ExecutionFailure("TOOL_BINDING_DISABLED")
             if definition.timeout_seconds > binding.max_timeout_seconds:
                 raise ExecutionFailure("TOOL_POLICY_DENIED")
-            if self.registry.resolve(binding.handler_key, binding.handler_version) is None:
+            handler = self.registry.resolve(binding.handler_key, binding.handler_version)
+            if handler is None:
                 raise ExecutionFailure("TOOL_HANDLER_UNAVAILABLE")
+            if definition.implementation is not None and (
+                (binding.handler_key, binding.handler_version) != (definition.implementation.key, definition.implementation.version)
+                or handler.implementation != definition.implementation
+            ):
+                raise ExecutionFailure("TOOL_IMPLEMENTATION_MISMATCH")
             return ResolvedTool(artifact, definition, binding)
         except ExecutionFailure:
             raise
         except Exception:
             raise ExecutionFailure("TOOL_CONFIGURATION_UNAVAILABLE") from None
 
-    @staticmethod
-    def _validate(value, schema, code):
+    def _validate(self, value, schema, code):
         try:
             if not isinstance(value, dict):
                 raise ValueError
             canonical_json(value)
-            validate_json(value, schema)
+            self.resources.validation.validate(value, schema)
         except JSONValidationUnavailable:
             raise ExecutionFailure("TOOL_VALIDATION_UNAVAILABLE") from None
         except Exception:
@@ -73,9 +87,10 @@ class PlatformToolGateway:
 
     async def _finish(self, claim, call_id, *, status, output_hash=None, error_code=None):
         try:
-            finished = await asyncio.to_thread(self.store.tool_bindings.finish_call, claim.lease, call_id,
-                                              status=status, output_hash=output_hash, error_code=error_code)
-        except TaskCancellationRequested:
+            finished = await run_sync(self.calls.finish_call, claim.lease, call_id,
+                                      status=status, output_hash=output_hash, error_code=error_code,
+                                      _on_cancel_error=accounting_error("TOOL_ACCOUNTING_RESULT_UNKNOWN"))
+        except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable, ExecutionFailure):
             raise
         except Exception:
             raise ExecutionFailure("TOOL_ACCOUNTING_RESULT_UNKNOWN") from None
@@ -83,15 +98,15 @@ class PlatformToolGateway:
             raise TaskLeaseLost("Tool call no longer owns its execution lease")
 
     async def invoke(self, claim: TaskClaim, node_id: str, reference: CapabilityDependency, values: dict) -> dict:
-        resolved = await asyncio.to_thread(self.resolve, claim, reference)
+        resolved = await run_sync(self.resolve, claim, reference)
         try:
             claim.limit_timeout(resolved.definition.timeout_seconds)
         except ExecutionDeadlineExceeded:
             raise ExecutionFailure("TOOL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
-        await asyncio.to_thread(self._validate, values, resolved.artifact.input_schema, "TOOL_INPUT_INVALID")
-        encoded = await asyncio.to_thread(canonical_json, values)
+        await run_sync(self._validate, values, resolved.artifact.input_schema, "TOOL_INPUT_INVALID")
+        encoded = await run_sync(canonical_json, values)
         input_hash = hashlib.sha256(encoded.encode()).hexdigest()
-        arguments = await asyncio.to_thread(deepcopy, values)
+        arguments = await run_sync(deepcopy, values)
         handler = self.registry.resolve(resolved.binding.handler_key, resolved.binding.handler_version)
         if handler is None:
             raise ExecutionFailure("TOOL_HANDLER_UNAVAILABLE")
@@ -100,20 +115,21 @@ class PlatformToolGateway:
         except ExecutionDeadlineExceeded:
             raise ExecutionFailure("TOOL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
         try:
-            call_id = await asyncio.to_thread(
-                self.store.tool_bindings.start_call, claim.lease, node_id, tool_key=reference.key,
+            call_id = await run_sync(
+                self.calls.start_call, claim.lease, node_id, tool_key=reference.key,
                 tool_version=reference.version, tool_hash=resolved.artifact.content_hash,
                 binding_key=resolved.binding.key, handler_key=resolved.binding.handler_key,
                 handler_version=resolved.binding.handler_version, input_hash=input_hash,
+                _on_cancel_error=accounting_error("TOOL_ACCOUNTING_RESULT_UNKNOWN"),
             )
         except ToolConflict:
             raise ExecutionFailure("TOOL_CALL_CONFLICT") from None
         except ToolConfigurationError:
             raise ExecutionFailure("TOOL_CONFIGURATION_UNAVAILABLE") from None
-        except TaskCancellationRequested:
+        except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable, ExecutionFailure):
             raise
         except Exception:
-            raise ExecutionFailure("TOOL_ACCOUNTING_UNAVAILABLE") from None
+            raise ExecutionFailure("TOOL_ACCOUNTING_RESULT_UNKNOWN") from None
         if call_id is None:
             raise TaskLeaseLost("Tool call no longer owns its execution lease")
         context = ToolContext(claim.task.project_key, claim.task.submitted_by, claim.task.id,
@@ -126,13 +142,13 @@ class PlatformToolGateway:
 
     async def invoke_agent(self, claim: AgentInvocation, execution_id: str, dispatch_id: str,
                            reference: CapabilityDependency, values: dict) -> dict:
-        resolved = await asyncio.to_thread(self.resolve, claim, reference)
+        resolved = await run_sync(self.resolve, claim, reference)
         try:
             claim.limit_timeout(resolved.definition.timeout_seconds)
         except ExecutionDeadlineExceeded:
             raise ExecutionFailure("TOOL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
-        await asyncio.to_thread(self._validate, values, resolved.artifact.input_schema, "TOOL_INPUT_INVALID")
-        arguments = await asyncio.to_thread(deepcopy, values)
+        await run_sync(self._validate, values, resolved.artifact.input_schema, "TOOL_INPUT_INVALID")
+        arguments = await run_sync(deepcopy, values)
         handler = self.registry.resolve(resolved.binding.handler_key, resolved.binding.handler_version)
         if handler is None:
             raise ExecutionFailure("TOOL_HANDLER_UNAVAILABLE")
@@ -141,9 +157,10 @@ class PlatformToolGateway:
         except ExecutionDeadlineExceeded:
             raise ExecutionFailure("TOOL_EXECUTION_DEADLINE_EXCEEDED", status="timed_out") from None
         try:
-            step, _ = await asyncio.to_thread(self.store.agents.start_tool, claim.lease, execution_id, dispatch_id,
-                                             arguments=arguments)
-        except (TaskLeaseLost, TaskCancellationRequested):
+            step, _ = await run_sync(self.agent_calls.start_tool, claim.lease, execution_id, dispatch_id,
+                                     arguments=arguments,
+                                     _on_cancel_error=accounting_error("TOOL_ACCOUNTING_RESULT_UNKNOWN"))
+        except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable, ExecutionFailure):
             raise
         except AgentStorageConflict:
             raise ExecutionFailure("TOOL_CALL_CONFLICT") from None
@@ -152,31 +169,21 @@ class PlatformToolGateway:
         except AgentStorageError:
             raise ExecutionFailure("TOOL_CONFIGURATION_UNAVAILABLE") from None
         except Exception:
-            raise ExecutionFailure("TOOL_ACCOUNTING_UNAVAILABLE") from None
+            raise ExecutionFailure("TOOL_ACCOUNTING_RESULT_UNKNOWN") from None
 
         async def finish(*, status, output_hash=None, error_code=None, output=None):
             try:
                 if status == "succeeded":
-                    await asyncio.to_thread(self.store.agents.finish_tool, claim.lease, execution_id, step.id, output=output)
+                    await run_sync(self.agent_calls.finish_tool, claim.lease, execution_id, step.id, output=output,
+                                   _on_cancel_error=accounting_error("TOOL_ACCOUNTING_RESULT_UNKNOWN"))
                 else:
-                    await asyncio.to_thread(self.store.agents.reject_call, claim.lease, execution_id, step.id,
-                                           error_code=error_code, cancelled=status == "cancelled")
-            except TaskCancellationRequested:
-                if status == "succeeded":
-                    await asyncio.to_thread(self.store.agents.reject_call, claim.lease, execution_id, step.id,
-                                           error_code="TOOL_CANCELLED_RESPONSE_DISCARDED", cancelled=True)
-                raise
-            except TaskLeaseLost:
+                    await run_sync(self.agent_calls.reject_call, claim.lease, execution_id, step.id,
+                                   error_code=error_code, cancelled=status == "cancelled",
+                                   _on_cancel_error=accounting_error("TOOL_ACCOUNTING_RESULT_UNKNOWN"))
+            except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable, ExecutionFailure):
                 raise
             except AgentValidationUnavailable:
-                if status == "succeeded":
-                    try:
-                        await asyncio.to_thread(self.store.agents.reject_call, claim.lease, execution_id, step.id,
-                                                error_code="TOOL_VALIDATION_UNAVAILABLE")
-                    except Exception:
-                        raise ExecutionFailure("TOOL_ACCOUNTING_RESULT_UNKNOWN") from None
-                    raise ExecutionFailure("TOOL_VALIDATION_UNAVAILABLE") from None
-                raise ExecutionFailure("TOOL_ACCOUNTING_RESULT_UNKNOWN") from None
+                raise ExecutionFailure("TOOL_VALIDATION_UNAVAILABLE") from None
             except AgentStorageError:
                 raise ExecutionFailure("TOOL_ACCOUNTING_RESULT_UNKNOWN") from None
             except Exception:
@@ -205,11 +212,11 @@ class PlatformToolGateway:
                 raise asyncio.CancelledError
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError
-            current = await asyncio.to_thread(self.resolve, claim, reference)
+            current = await run_sync(self.resolve, claim, reference)
             if current.artifact.content_hash != resolved.artifact.content_hash or current.binding != resolved.binding:
                 raise ExecutionFailure("TOOL_CONFIGURATION_CHANGED")
-            await asyncio.to_thread(self._validate, output, resolved.artifact.output_schema, "TOOL_OUTPUT_INVALID")
-            output_hash = hashlib.sha256((await asyncio.to_thread(canonical_json, output)).encode()).hexdigest()
+            await run_sync(self._validate, output, resolved.artifact.output_schema, "TOOL_OUTPUT_INVALID")
+            output_hash = hashlib.sha256((await run_sync(canonical_json, output)).encode()).hexdigest()
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError
             claim.limit_timeout(resolved.definition.timeout_seconds)
@@ -225,9 +232,11 @@ class PlatformToolGateway:
                 raise ExecutionFailure(code, status="timed_out") from None
             await finish(status="failed", error_code="TOOL_TIMEOUT_RESULT_UNKNOWN")
             raise ExecutionFailure("TOOL_TIMEOUT_RESULT_UNKNOWN", status="timed_out") from None
-        except TaskCancellationRequested:
+        except (TaskLeaseLost, TaskCancellationRequested, ExecutionResourceUnstoppable):
             raise
         except ExecutionFailure as exc:
+            if exc.code.endswith("ACCOUNTING_RESULT_UNKNOWN"):
+                raise
             code = exc.code if re.fullmatch(r"TOOL_[A-Z0-9_]{1,90}", exc.code) else "TOOL_EXECUTION_FAILED_RESULT_UNKNOWN"
             await finish(status="failed", error_code=code)
             raise ExecutionFailure(code, status=exc.status) from None

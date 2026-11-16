@@ -31,11 +31,12 @@ def config_for(url=None):
     return config
 
 
-def test_initial_lineage_has_one_baseline_and_no_implicit_history():
+def test_lineage_has_one_baseline_and_explicit_incremental_history():
     scripts = ScriptDirectory.from_config(config_for())
     assert scripts.get_heads() == [PLATFORM_SCHEMA_REVISION]
     revisions = list(scripts.walk_revisions())
-    assert len(revisions) == 1 and revisions[0].down_revision is None
+    assert [revision.revision for revision in revisions] == [PLATFORM_SCHEMA_REVISION, "0002_outbound_evidence", "0001_platform"]
+    assert revisions[0].down_revision == "0002_outbound_evidence" and revisions[-1].down_revision is None
 
 
 def test_fresh_initialization_matches_platform_contract(pg_url):
@@ -82,6 +83,27 @@ def test_unknown_revision_is_not_adopted_or_stamped(pg_url):
             upgrade_platform(engine, schema, apply=True)
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "unrecognized_revision"
+    finally:
+        engine.dispose()
+
+
+def test_explicit_business_increment_preserves_previous_schema_data(pg_url):
+    url = fresh_database_url(pg_url)
+    command.upgrade(config_for(url), "0002_outbound_evidence")
+    engine = create_engine(url)
+    try:
+        with engine.connect() as connection:
+            schema = connection.scalar(text("SELECT current_schema()"))
+            previous = connection.scalar(text("SELECT count(*) FROM ai_project"))
+        preview = upgrade_platform(engine, schema)
+        assert preview["from_revision"] == "0002_outbound_evidence" and not preview["changed"]
+        assert upgrade_platform(engine, schema, apply=True)["changed"]
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == PLATFORM_SCHEMA_REVISION
+            assert connection.scalar(text("SELECT count(*) FROM ai_project")) == previous
+        constraint = next(item for item in inspect(engine).get_check_constraints("ai_workflow_node")
+                          if item["name"] == "ck_ai_workflow_node_kind")
+        assert "step" in constraint["sqltext"] and "result" in constraint["sqltext"]
     finally:
         engine.dispose()
 

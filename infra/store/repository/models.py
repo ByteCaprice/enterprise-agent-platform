@@ -8,8 +8,9 @@ from uuid import uuid4
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
-from domain import LogEvent, utc_now
+from domain import utc_now
 from domain.capability import ModelPolicyDefinition
+from domain.outbound_operation import OutboundEvidence
 from domain.platform_model import (
     ModelCallConflict,
     ModelConfigurationError,
@@ -24,7 +25,6 @@ from infra.store.model import (
     AiCapability,
     AiCapabilityVersion,
     AiProject,
-    AiRunLog,
     AiTask,
     AiWorkflowNode,
 )
@@ -32,11 +32,29 @@ from infra.store.model.ai_model_provider import AiPlatformModelProvider
 from infra.store.model.ai_platform_model_call import AiPlatformModelCall
 from infra.store.repository.base import BaseRepository
 from infra.store.repository.execution import ExecutionWriteMode, active_execution
-from infra.store.repository.limits import account_model_call
-from infra.store.repository.task_events import append_task_event
+from infra.store.repository.execution_effects import (
+    record_model_audit,
+    record_model_call_settled,
+    record_model_call_started,
+)
+from infra.store.repository.outcome_effects import record_outbound_evidence
+from infra.store.repository.workflow_scope import declared_workflow_activity
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_CODE = re.compile(r"^MODEL_[A-Z0-9_]{1,90}$")
+
+
+def _permits_fallback(call):
+    """Only coherent authoritative call evidence can permit another paid attempt."""
+    if call.status != "failed" or call.error_code != "MODEL_UPSTREAM_UNAVAILABLE" or call.http_status != 429:
+        return False
+    try:
+        evidence = OutboundEvidence.model_validate(getattr(call, "outbound_evidence", None))
+    except ValueError:
+        return False
+    return (evidence.retry_permission == "safe_response" and evidence.http_status == call.http_status and
+            evidence.actual_model == call.actual_model and evidence.request_id == call.provider_request_id and
+            all(getattr(call, key) == value for key, value in evidence.usage.model_dump().items()))
 
 
 class ModelRepository(BaseRepository):
@@ -44,17 +62,6 @@ class ModelRepository(BaseRepository):
         with self._read() as session:
             session.execute(select(AiPlatformModelProvider).limit(0))
             session.execute(select(AiPlatformModelCall).limit(0))
-
-    @staticmethod
-    def _audit(session, project_key, task_id, call_id, actor, event):
-        session.add(AiRunLog.from_domain(LogEvent(
-            trace_id=f"task:{task_id or 'model-provider'}", component="model_audit", event_type=event,
-            message=event.replace("_", " "),
-            data={"project_key": project_key, "task_id": task_id, "call_id": call_id, "actor": actor},
-        )))
-        if task_id is not None:
-            account_model_call(session, call_id, event)
-            append_task_event(session, task_id, event, entity_kind="model_call", entity_id=call_id)
 
     @staticmethod
     def _record(row):
@@ -73,7 +80,7 @@ class ModelRepository(BaseRepository):
                 enabled=True, created_by=actor, create_time=utc_now(),
             )
             session.add(row)
-            self._audit(session, project_key, None, None, actor, "model_provider_created")
+            record_model_audit(session, project_key, None, None, actor, "model_provider_created")
             try:
                 session.flush()
             except IntegrityError as exc:
@@ -106,7 +113,7 @@ class ModelRepository(BaseRepository):
             if row is None:
                 raise ModelProviderNotFound("Provider not found")
             row.enabled = enabled
-            self._audit(session, project_key, None, None, actor, "model_provider_enabled" if enabled else "model_provider_disabled")
+            record_model_audit(session, project_key, None, None, actor, "model_provider_enabled" if enabled else "model_provider_disabled")
             session.flush()
             return self._record(row)
 
@@ -128,18 +135,12 @@ class ModelRepository(BaseRepository):
             ).with_for_update()).scalar_one_or_none()
             if node is None or node.kind != "llm" or node.status != "running":
                 raise ModelConfigurationError("Model call configuration is invalid")
-            workflow = session.execute(select(AiCapabilityVersion).where(
-                AiCapabilityVersion.capability_id == task.capability_id,
-                AiCapabilityVersion.version == task.version,
-            )).scalar_one_or_none()
-            if workflow is None or workflow.status != "published" or workflow.content_hash != task.content_hash:
-                raise ModelConfigurationError("Model call configuration is invalid")
-            declared = workflow.definition.get("nodes", [])
-            definition_node = next((item for item in declared if isinstance(item, dict) and item.get("key") == node.node_key), None)
-            if definition_node is None or definition_node.get("kind") != "llm":
-                raise ModelConfigurationError("Model call configuration is invalid")
-            capability = definition_node.get("capability", {})
-            if not isinstance(capability, dict) or capability.get("key") != policy_key or capability.get("version") != policy_version:
+            try:
+                definition_node, _, reference = declared_workflow_activity(session, task, node)
+            except ValueError:
+                raise ModelConfigurationError("Model call configuration is invalid") from None
+            if (definition_node.kind != "llm" or reference is None or
+                    (reference.key, reference.version) != (policy_key, policy_version)):
                 raise ModelConfigurationError("Model call configuration is invalid")
             policy = session.execute(select(AiCapability, AiCapabilityVersion).join(
                 AiCapabilityVersion, AiCapabilityVersion.capability_id == AiCapability.id
@@ -164,13 +165,13 @@ class ModelRepository(BaseRepository):
             ).order_by(AiPlatformModelCall.start_time, AiPlatformModelCall.id).with_for_update()).all()
             if any(row.status == "running" for row in previous):
                 raise ModelCallConflict("A model call is already running")
-            if (any(row.status != "failed" or row.error_code != "MODEL_UPSTREAM_UNAVAILABLE" for row in previous)
+            if (any(not _permits_fallback(row) for row in previous)
                     or any(row.input_hash != input_hash or row.policy_hash != policy_hash for row in previous)
                     or [row.requested_model for row in previous] != candidates[:len(previous)]
                     or len(previous) >= len(candidates) or requested_model != candidates[len(previous)]):
                 raise ModelCallConflict("Model call cannot be replayed")
             prompt_key = prompt_version = prompt_hash = None
-            prompt = definition_node.get("prompt")
+            prompt = definition_node.prompt.model_dump() if definition_node.prompt is not None else None
             if prompt is not None:
                 if not isinstance(prompt, dict) or not isinstance(prompt.get("key"), str) or not isinstance(prompt.get("version"), str):
                     raise ModelConfigurationError("Model call configuration is invalid")
@@ -214,11 +215,15 @@ class ModelRepository(BaseRepository):
                 "attempt": attempt.id, "worker": lease.worker_id, "token": lease.token, "node": node_id}).scalar_one_or_none()
         if inserted is None:
             return None
-        self._audit(session, task.project_key, task.id, call_id, lease.worker_id, "model_call_started")
+        record_model_call_started(session, task.project_key, task.id, call_id, lease.worker_id)
         return call_id
 
     def finish_call(self, lease, call_id, *, status, actual_model=None, output_hash=None, usage=None,
-                    error_code=None, http_status=None, provider_request_id=None):
+                    error_code=None, http_status=None, provider_request_id=None, evidence=None):
+        if evidence is not None:
+            evidence = OutboundEvidence.model_validate(evidence)
+            actual_model, usage = evidence.actual_model, evidence.usage
+            http_status, provider_request_id = evidence.http_status, evidence.request_id
         if status not in {"succeeded", "failed", "cancelled"}:
             raise ValueError("Invalid model call status")
         if status == "succeeded":
@@ -243,12 +248,14 @@ class ModelRepository(BaseRepository):
             discarded = task.cancel_request_id is not None and status == "succeeded"
             if discarded:
                 status, output_hash, error_code = "cancelled", None, "MODEL_CANCELLED_RESPONSE_DISCARDED"
+                if evidence is not None:
+                    evidence = evidence.with_acceptance(False)
             # Conditional update is the final lease and running-node fence.
             row = session.execute(text("""
                 UPDATE ai_platform_model_call c SET status=:status, actual_model=:actual,
                     output_hash=:output_hash, prompt_tokens=:prompt_tokens, completion_tokens=:completion_tokens,
                     total_tokens=:total_tokens, http_status=:http_status, provider_request_id=:request_id,
-                    error_code=:error, finish_time=clock_timestamp()
+                    error_code=:error, outbound_evidence=CAST(:outbound_evidence AS jsonb), finish_time=clock_timestamp()
                 WHERE c.id=:call AND c.task_id=:task AND c.task_attempt_id=:attempt AND c.status='running'
                   AND EXISTS (SELECT 1 FROM ai_task t JOIN ai_task_attempt a ON a.task_id=t.id
                     JOIN ai_workflow_node n ON n.task_id=t.id AND n.task_attempt_id=a.id
@@ -260,10 +267,13 @@ class ModelRepository(BaseRepository):
                 "prompt_tokens": data.get("prompt_tokens"), "completion_tokens": data.get("completion_tokens"),
                 "total_tokens": data.get("total_tokens"), "http_status": http_status,
                 "request_id": provider_request_id, "error": error_code, "call": call_id,
+                "outbound_evidence": evidence.model_dump_json() if evidence is not None else None,
                 "task": task.id, "attempt": attempt.id, "worker": lease.worker_id, "token": lease.token}).scalar_one_or_none()
             if row is None:
                 return False
-            self._audit(session, task.project_key, task.id, call_id, lease.worker_id, "model_call_" + status)
+            if evidence is not None:
+                record_outbound_evidence(session, task.project_key, task.id, call_id, lease.worker_id, evidence)
+            record_model_call_settled(session, task.project_key, task.id, call_id, lease.worker_id, "model_call_" + status)
         if discarded:
             raise TaskCancellationRequested("Model response settled but not accepted")
         return True

@@ -12,6 +12,14 @@ import asyncio
 import hashlib
 from collections.abc import Mapping
 
+from domain.capability_definitions import (
+    WORKFLOW_CHECKPOINT_PROFILE,
+    WORKFLOW_INTERPRETER_PROFILE,
+    interpret_definition,
+)
+from domain.execution_authorization import ExecutionAuthorizationPort
+from domain.execution_ports import WorkflowCheckpoints
+from domain.execution_requirements import WORKFLOW_ADAPTER_PROFILES
 from domain.task import canonical_json
 from domain.task_execution import (
     ExecutionFailure,
@@ -20,19 +28,19 @@ from domain.task_execution import (
     TaskClaim,
     TaskLeaseLost,
 )
-from domain.workflow import WorkflowDefinition, WorkflowNode
+from domain.workflow import WorkflowContractError, WorkflowNode
 from domain.workflow_runtime import WorkflowAdapterUnavailable, WorkflowNodeExecutor, WorkflowNodeRegistry
 from framework.workflow import apply_rule, map_values, resolve_binding
 from framework.workflow_plan import PlannedWorkflowNode, WorkflowExecutionPlan, WorkflowPlanError, compile_workflow
-from orchestration.execution_authorization import ExecutionAuthorizer
 
 NodeExecutor = WorkflowNodeExecutor
 
 
 class WorkflowExecutor:
-    def __init__(self, store, adapters: Mapping[str, NodeExecutor] | WorkflowNodeRegistry | None = None):
-        self.store = store
-        self.authorizer = ExecutionAuthorizer(store)
+    def __init__(self, checkpoints: WorkflowCheckpoints, authorization: ExecutionAuthorizationPort,
+                 adapters: Mapping[str, NodeExecutor] | WorkflowNodeRegistry | None = None):
+        self.checkpoints = checkpoints
+        self.authorizer = authorization
         self._registry = adapters if isinstance(adapters, WorkflowNodeRegistry) else WorkflowNodeRegistry.from_mapping(adapters or {})
 
     @property
@@ -43,20 +51,35 @@ class WorkflowExecutor:
     def node_kinds(self) -> frozenset[str]:
         return self._registry.kinds | {"rule"}
 
+    @property
+    def adapter_descriptors(self):
+        return self._registry.descriptors
+
+    @property
+    def interpreter_profile(self):
+        return WORKFLOW_INTERPRETER_PROFILE
+
+    @property
+    def checkpoint_profile(self):
+        return WORKFLOW_CHECKPOINT_PROFILE
+
     def _plan(self, claim: TaskClaim) -> WorkflowExecutionPlan:
         try:
             if claim.task.capability_kind != "workflow":
                 raise ValueError("Invalid pinned workflow")
             claim.artifact.require_published(version=claim.task.version, content_hash=claim.task.content_hash)
-            canonical_json(claim.artifact.definition)
-            plan = compile_workflow(WorkflowDefinition.model_validate(claim.artifact.definition))
-        except WorkflowPlanError as exc:
+            contract = interpret_definition("workflow", claim.artifact)
+            plan = compile_workflow(contract.materialize())
+        except (WorkflowPlanError, WorkflowContractError) as exc:
             raise ExecutionFailure(exc.code) from None
         except Exception:
             raise ExecutionFailure("WORKFLOW_DEFINITION_INVALID") from None
         # Availability is a deployment property, not a graph or authorization flag.
         try:
             self._registry.require(plan.required_adapters)
+            if any(self._registry.get(kind).descriptor.profile != WORKFLOW_ADAPTER_PROFILES[kind]
+                   for kind in plan.required_adapters):
+                raise WorkflowAdapterUnavailable("Workflow adapter profile is incompatible")
         except WorkflowAdapterUnavailable:
             raise ExecutionFailure("WORKFLOW_ADAPTER_UNAVAILABLE") from None
         return plan
@@ -69,6 +92,8 @@ class WorkflowExecutor:
         referenced = {binding.node for binding in bindings if binding.source == "node"}
         upstream = {key: value for key, value in outputs.items() if key in referenced}
         source = {
+            "interpreter_profile": WORKFLOW_INTERPRETER_PROFILE,
+            "checkpoint_profile": WORKFLOW_CHECKPOINT_PROFILE,
             "task_input": hashlib.sha256(canonical_json(claim.input).encode()).hexdigest(),
             "upstream": hashlib.sha256(canonical_json(upstream).encode()).hexdigest(),
             "definition": claim.task.content_hash,
@@ -118,7 +143,7 @@ class WorkflowExecutor:
         return "succeeded", output
 
     async def _finish(self, claim, checkpoint, *, status, output=None, error_code=None):
-        finished = await asyncio.to_thread(self.store.workflows.finish, claim.lease, checkpoint.record.id,
+        finished = await asyncio.to_thread(self.checkpoints.finish, claim.lease, checkpoint.record.id,
                                           status=status, output=output, error_code=error_code)
         if not finished:
             raise TaskLeaseLost("Workflow node no longer owns the execution lease")
@@ -154,7 +179,10 @@ class WorkflowExecutor:
             raise ExecutionFailure("EXECUTION_NOT_AUTHORIZED")
         try:
             input_hash = await asyncio.to_thread(self._source_hash, claim, node, outputs)
-            checkpoint = await asyncio.to_thread(self.store.workflows.begin, claim.lease, node.key, input_hash)
+            checkpoint = await asyncio.to_thread(
+                self.checkpoints.begin, claim.lease, node.key, input_hash,
+                interpreter_profile=WORKFLOW_INTERPRETER_PROFILE, checkpoint_profile=WORKFLOW_CHECKPOINT_PROFILE,
+            )
         except ValueError:
             raise ExecutionFailure("WORKFLOW_CHECKPOINT_CONFLICT") from None
         if checkpoint is None:

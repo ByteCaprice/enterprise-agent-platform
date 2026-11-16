@@ -11,6 +11,7 @@
 !/infra/
 !/interfaces/
 !/orchestration/
+!/capability_hub/
 !/tests/
 !/docs/
 !/scripts/
@@ -32,6 +33,7 @@ pip.conf
 private/
 secrets/
 credentials/
+config/
 .ssh/
 .aws/
 .azure/
@@ -78,6 +80,9 @@ id_ecdsa
 !/docs/frontend-integration.md
 !/docs/deployment.md
 !/docs/development.md
+!/docs/capability-hub.md
+!/docs/weather-query-demo.md
+!/docs/agent-skills-mcp.md
 !/docs/roadmap.md
 !/docs/repository-policy.md
 /docs/internal/

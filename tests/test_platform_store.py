@@ -20,7 +20,7 @@ PROJECT = "/v2/projects/platform"
 
 
 def test_platform_store_is_independent_and_serves_prompt_and_task(pg_url, monkeypatch):
-    from interfaces.http import platform_server
+    from interfaces import runtime
 
     url = fresh_database_url(pg_url)
     command.upgrade(config_for(url), "head")
@@ -36,8 +36,8 @@ def test_platform_store_is_independent_and_serves_prompt_and_task(pg_url, monkey
         name="platform-test-admin", api_key="sha256:" + hashlib.sha256(ADMIN_TOKEN.encode()).hexdigest(),
         scopes=["admin"],
     ))
-    monkeypatch.setattr(platform_server, "load_settings", lambda _path: {"database": {"schema": schema}})
-    monkeypatch.setattr(platform_server, "build_engine", lambda _settings: engine)
+    monkeypatch.setattr(runtime, "load_settings", lambda _path: {"database": {"schema": schema}})
+    monkeypatch.setattr(runtime, "build_engine", lambda _settings: engine)
     statements: list[str] = []
     def record_sql(_conn, _cursor, statement, *_args):
         statements.append(statement.lower())

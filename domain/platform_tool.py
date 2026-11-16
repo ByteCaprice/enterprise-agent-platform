@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from domain.business_code import CodeReference
 from domain.capability import Key, Version
 from domain.governance import GovernanceInput
 from domain.platform_agent import CallOwner, CallOwnership
@@ -30,9 +31,17 @@ class ToolConflict(ToolConfigurationError):
 class ToolDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
+    definition_version: Literal["tool.v1", "tool.code.v1"] = "tool.v1"
     binding_key: Key
     operation_type: Literal["read_only"]
     timeout_seconds: float = Field(default=30, strict=True, gt=0, le=300)
+    implementation: CodeReference | None = None
+
+    @model_validator(mode="after")
+    def explicit_implementation(self):
+        if (self.definition_version == "tool.code.v1") != (self.implementation is not None):
+            raise ValueError("Only tool.code.v1 requires a pinned code implementation")
+        return self
 
 
 class ToolBindingCreate(GovernanceInput):
@@ -85,12 +94,20 @@ class InstalledReadonlyTool:
     key: str
     version: str
     execute: Callable[[ToolContext, dict], Awaitable[dict]] = field(repr=False)
+    implementation: CodeReference | None = None
 
     def __post_init__(self):
         TypeAdapter(Key).validate_python(self.key)
         TypeAdapter(Version).validate_python(self.version)
         if not inspect.iscoroutinefunction(self.execute):
             raise ValueError("Install an explicit async, cancellation-cooperative tool handler")
+        if self.implementation is not None:
+            if not isinstance(self.implementation, CodeReference):
+                raise ValueError("Install an explicit CodeReference for the tool handler")
+            reference = CodeReference.model_validate(self.implementation.model_dump())
+            if (reference.key, reference.version) != (self.key, self.version):
+                raise ValueError("Tool implementation must pin the installed handler key/version")
+            object.__setattr__(self, "implementation", reference)
 
 
 class PlatformToolCallRecord(CallOwnership):

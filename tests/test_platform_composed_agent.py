@@ -8,14 +8,14 @@ from test_platform_agent_broker import MockTurns
 from test_platform_agent_storage import root_fixture
 from test_platform_tasks import ADMIN, service_identity, submit
 from test_platform_tasks import inbox as inbox_fixture
+from worker_support import agent_gateway, tool_gateway
 
 from domain.capability import CapabilitySpec, CapabilityVersionDraft
 from framework.readonly_tools import builtin_readonly_tools
 from infra.model_credentials import EnvironmentCredentialResolver
+from infra.schema_validation import IsolatedJSONValidator
 from interfaces.worker.platform import run_platform_worker
-from orchestration.agent_model_gateway import PlatformAgentModelGateway
 from orchestration.capability_service import CapabilityService
-from orchestration.platform_tool_gateway import PlatformToolGateway
 
 inbox = inbox_fixture
 
@@ -24,7 +24,7 @@ inbox = inbox_fixture
 def test_workflow_agent_keeps_one_root_claim_and_atomic_safe_history(inbox, monkeypatch, delegated):
     client, store = inbox
     _, _, unused_root = root_fixture(client, store, monkeypatch, begin=False, claim_task=False)
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     service.create("payments", CapabilitySpec(key="agent-flow", name="Composed Agent", kind="workflow"), "task-admin")
     service.create_draft("payments", "agent-flow", CapabilityVersionDraft(
         version="1", definition={
@@ -43,8 +43,8 @@ def test_workflow_agent_keeps_one_root_claim_and_atomic_safe_history(inbox, monk
     assert not asyncio.run(run_platform_worker(store, once=True))
     assert client.get(target, headers=headers).json()["status"] == "queued"
     turns = MockTurns()
-    tools = PlatformToolGateway(store, builtin_readonly_tools())
-    gateway = PlatformAgentModelGateway(store, turns, EnvironmentCredentialResolver(), tools)
+    tools = tool_gateway(store, builtin_readonly_tools())
+    gateway = agent_gateway(store, turns, EnvironmentCredentialResolver(), tools)
     assert asyncio.run(run_platform_worker(store, once=True, workflow_agents=True,
                                            execution_kinds=("workflow",), agent_gateway=gateway))
     result = client.get(target + "/result", headers=headers).json()

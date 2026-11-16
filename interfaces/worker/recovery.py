@@ -17,8 +17,8 @@ async def run_recovery_worker(store, *, once=False, worker_id=None, poll_seconds
 
     async def run():
         while not stop.is_set():
-            rejected = await asyncio.to_thread(store.tasks.reject_disabled_project_tasks)
-            expired = await asyncio.to_thread(store.tasks.recover_expired)
+            rejected = await asyncio.to_thread(store.task_queue.reject_disabled_project_tasks)
+            expired = await asyncio.to_thread(store.task_queue.recover_expired)
             if once:
                 return {"rejected": rejected, "expired": expired}
             if not (rejected or expired):

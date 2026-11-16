@@ -8,7 +8,7 @@ from uuid import uuid4
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
-from domain import LogEvent, utc_now
+from domain import utc_now
 from domain.platform_tool import ToolBindingNotFound, ToolConfigurationError, ToolConflict, ToolDefinition
 from domain.task import TaskNotFound
 from domain.task_execution import TaskCancellationRequested
@@ -18,13 +18,13 @@ from infra.store.model import (
     AiPlatformToolBinding,
     AiPlatformToolCall,
     AiProject,
-    AiRunLog,
     AiTask,
     AiWorkflowNode,
 )
 from infra.store.repository.base import BaseRepository
 from infra.store.repository.execution import ExecutionWriteMode, active_execution
-from infra.store.repository.task_events import append_task_event
+from infra.store.repository.execution_effects import record_tool_audit, record_tool_call_transition
+from infra.store.repository.workflow_scope import declared_workflow_activity
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _ERROR = re.compile(r"^TOOL_[A-Z0-9_]{1,90}$")
@@ -36,17 +36,6 @@ class ToolRepository(BaseRepository):
             session.execute(select(AiPlatformToolBinding).limit(0))
             session.execute(select(AiPlatformToolCall).limit(0))
 
-    @staticmethod
-    def _audit(session, project, actor, event, *, task_id=None, call_id=None, binding_key=None):
-        session.add(AiRunLog.from_domain(LogEvent(
-            trace_id=f"task:{task_id}" if task_id else f"project:{project}", component="tool_audit",
-            event_type=event, message=event.replace("_", " "),
-            data={"project_key": project, "actor": actor, "task_id": task_id,
-                  "call_id": call_id, "binding_key": binding_key},
-        )))
-        if task_id is not None:
-            append_task_event(session, task_id, event, entity_kind="tool_call", entity_id=call_id)
-
     def create_binding(self, project_key, spec, actor):
         with self._sf.begin() as session:
             project = session.scalar(select(AiProject).where(AiProject.key == project_key).with_for_update())
@@ -57,7 +46,7 @@ class ToolRepository(BaseRepository):
             row = AiPlatformToolBinding(project_key=project_key, **spec.model_dump(), enabled=True,
                                         created_by=actor, create_time=utc_now())
             session.add(row)
-            self._audit(session, project_key, actor, "tool_binding_created", binding_key=spec.key)
+            record_tool_audit(session, project_key, actor, "tool_binding_created", binding_key=spec.key)
             session.flush()
             return row.to_record()
 
@@ -87,7 +76,7 @@ class ToolRepository(BaseRepository):
             if row is None:
                 raise ToolBindingNotFound("Tool binding not found")
             row.enabled = enabled
-            self._audit(session, project_key, actor, "tool_binding_enabled" if enabled else "tool_binding_disabled",
+            record_tool_audit(session, project_key, actor, "tool_binding_enabled" if enabled else "tool_binding_disabled",
                         binding_key=key)
             session.flush()
             return row.to_record()
@@ -107,14 +96,11 @@ class ToolRepository(BaseRepository):
             ).with_for_update())
             if node is None or node.kind != "tool" or node.status != "running":
                 raise ToolConfigurationError("Tool node is unavailable")
-            workflow = session.scalar(select(AiCapabilityVersion).where(
-                AiCapabilityVersion.capability_id == task.capability_id, AiCapabilityVersion.version == task.version,
-            ))
-            if workflow is None or workflow.status != "published" or workflow.content_hash != task.content_hash:
-                raise ToolConfigurationError("Workflow artifact is unavailable")
-            declared = next((item for item in workflow.definition.get("nodes", [])
-                             if isinstance(item, dict) and item.get("key") == node.node_key), None)
-            if declared is None or declared.get("kind") != "tool" or declared.get("capability") != {
+            try:
+                declared, _, reference = declared_workflow_activity(session, task, node)
+            except ValueError:
+                raise ToolConfigurationError("Workflow artifact is unavailable") from None
+            if declared.kind != "tool" or reference is None or reference.model_dump() != {
                 "key": tool_key, "version": tool_version,
             }:
                 raise ToolConfigurationError("Tool call does not match its declared node")
@@ -132,6 +118,10 @@ class ToolRepository(BaseRepository):
                     binding.operation_type != "read_only" or definition.timeout_seconds > binding.max_timeout_seconds or
                     (binding.handler_key, binding.handler_version) != (handler_key, handler_version)):
                 raise ToolConfigurationError("Tool binding is unavailable")
+            if definition.implementation is not None and (handler_key, handler_version) != (
+                definition.implementation.key, definition.implementation.version,
+            ):
+                raise ToolConfigurationError("Tool binding does not match its pinned implementation")
             call_id = uuid4().hex
             try:
                 inserted = session.execute(text("""
@@ -157,7 +147,7 @@ class ToolRepository(BaseRepository):
                 raise ToolConflict("Tool node already has invocation evidence") from None
             if inserted is None:
                 return None
-            self._audit(session, task.project_key, lease.worker_id, "tool_call_started",
+            record_tool_call_transition(session, task.project_key, lease.worker_id, "tool_call_started",
                         task_id=task.id, call_id=call_id, binding_key=binding_key)
             return call_id
 
@@ -191,7 +181,7 @@ class ToolRepository(BaseRepository):
                     "task": task.id, "attempt": attempt.id, "worker": lease.worker_id, "token": lease.token}).scalar_one_or_none()
             if updated is None:
                 return False
-            self._audit(session, task.project_key, lease.worker_id, "tool_call_" + status, task_id=task.id, call_id=call_id)
+            record_tool_call_transition(session, task.project_key, lease.worker_id, "tool_call_" + status, task_id=task.id, call_id=call_id)
         if discarded:
             raise TaskCancellationRequested("Tool response settled but not accepted")
         return True

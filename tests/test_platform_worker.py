@@ -7,8 +7,9 @@ from dataclasses import replace
 
 import pytest
 from sqlalchemy import text
-from test_platform_tasks import ADMIN, service_identity, submit
+from test_platform_tasks import ADMIN, publish_completion_flow, record_completion_node, service_identity, submit
 from test_platform_tasks import inbox as inbox_fixture
+from worker_support import worker_capabilities, worker_services
 
 from domain.task_control import ControlState, ExecutionObservation
 from orchestration.platform_worker import PlatformWorker, WorkerPolicy
@@ -20,12 +21,21 @@ POLICY = WorkerPolicy(lease_seconds=10, heartbeat_seconds=0.1, execution_timeout
 
 
 def run(store, executor, policy=POLICY):
-    return asyncio.run(PlatformWorker(store, "new-worker", {"agent": executor}, policy=policy).run_once())
+    async def evidenced_executor(claim):
+        result = await executor(claim)
+        if claim.task.capability_kind == "workflow":
+            record_completion_node(store, claim, result)
+        return result
+
+    return asyncio.run(PlatformWorker(worker_services(store), "new-worker", {
+        "agent": evidenced_executor, "workflow": evidenced_executor,
+    }, policy=policy, capabilities=worker_capabilities()).run_once())
 
 
 def test_installed_adapter_executes_pinned_task_and_result_is_separate_from_metadata(inbox):
     client, store = inbox
-    accepted = submit(client)
+    publish_completion_flow(store)
+    accepted = submit(client, capability_key="completion-flow")
     target = accepted.headers["Location"]
     assert client.get(target + "/attempts", headers=ADMIN).json() == []
     assert client.get(target + "/result", headers=ADMIN).json() == {
@@ -50,12 +60,13 @@ def test_installed_adapter_executes_pinned_task_and_result_is_separate_from_meta
     assert not {"input", "token", "result", "definition"} & attempts[0].keys()
     assert calls[0].lease.token not in repr(calls[0])
     assert not run(store, execute)
-    assert submit(client).json()["status"] == "succeeded"
+    assert submit(client, capability_key="completion-flow").json()["status"] == "succeeded"
 
 
 def test_gateway_bounded_sync_wait_reuses_durable_task(inbox):
     client, store = inbox
-    task = {"capability_key": "review", "version": "1", "input": {"name": "Synthetic"}}
+    publish_completion_flow(store)
+    task = {"capability_key": "completion-flow", "version": "1", "input": {"name": "Synthetic"}}
     headers = {**ADMIN, "Idempotency-Key": "sync-request"}
     response = client.post("/v2/projects/payments/tasks/execute", headers=headers,
                            json={"task": task, "mode": "sync", "wait_seconds": 0.01})
@@ -74,9 +85,10 @@ def test_gateway_bounded_sync_wait_reuses_durable_task(inbox):
 
 def test_result_and_attempts_recheck_identity_and_capability_scope(inbox):
     client, store = inbox
+    publish_completion_flow(store)
     identity, _, headers = service_identity(store)
     _, _, other_headers = service_identity(store, key="other-business")
-    target = submit(client, headers=headers).headers["Location"]
+    target = submit(client, headers=headers, capability_key="completion-flow").headers["Location"]
 
     async def execute(_claim):
         return {"private": "synthetic"}
@@ -121,8 +133,9 @@ def test_permission_shrink_before_execution_never_calls_adapter(inbox, revoke):
 
 def test_rotated_bearer_does_not_invalidate_already_accepted_identity_work(inbox):
     client, store = inbox
+    publish_completion_flow(store)
     identity, key, headers = service_identity(store)
-    accepted = submit(client, headers=headers)
+    accepted = submit(client, headers=headers, capability_key="completion-flow")
     store.governance.revoke_key("payments", identity["id"], key["id"], "task-admin")
 
     async def execute(_claim):
@@ -193,7 +206,7 @@ def test_lost_lease_cancels_execution_and_recovery_marks_unknown(inbox, monkeypa
     # Simulate time passage only in this test-owned schema, never persistent SIT.
     with store.engine.begin() as connection:
         connection.execute(text("UPDATE ai_task_attempt SET lease_expires_at = start_time WHERE status = 'running'"))
-    assert store.tasks.recover_expired() == 1
+    assert store.task_queue.recover_expired() == 1
     result = client.get(target + "/result", headers=ADMIN).json()
     assert result["error_code"] == "LEASE_EXPIRED_RESULT_UNKNOWN"
     assert not run(store, execute)
@@ -201,18 +214,21 @@ def test_lost_lease_cancels_execution_and_recovery_marks_unknown(inbox, monkeypa
 
 def test_concurrent_run_once_on_same_worker_is_rejected(inbox):
     client, store = inbox
-    submit(client)
+    publish_completion_flow(store)
+    submit(client, capability_key="completion-flow")
 
     async def scenario():
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def execute(_claim):
+        async def execute(claim):
             started.set()
             await release.wait()
+            record_completion_node(store, claim, {"done": True})
             return {"done": True}
 
-        worker = PlatformWorker(store, "single-owner", {"agent": execute}, policy=POLICY)
+        worker = PlatformWorker(worker_services(store), "single-owner", {"workflow": execute}, policy=POLICY,
+                                capabilities=worker_capabilities("workflow"))
         task = asyncio.create_task(worker.run_once())
         await asyncio.wait_for(started.wait(), 5)
         with pytest.raises(RuntimeError, match="already executing"):

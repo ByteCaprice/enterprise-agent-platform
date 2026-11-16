@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 
+from domain.capability_definitions import WORKFLOW_CHECKPOINT_PROFILE, WORKFLOW_INTERPRETER_PROFILE
 from domain.task import TaskError, canonical_json
 from domain.workflow import WorkflowBinding, WorkflowDefinition, WorkflowNode
 
@@ -45,6 +46,8 @@ class WorkflowExecutionPlan:
     output_snapshot: str = field(repr=False)
     max_parallel_rules: int
     required_adapters: frozenset[str]
+    interpreter_profile: str = WORKFLOW_INTERPRETER_PROFILE
+    checkpoint_profile: str = WORKFLOW_CHECKPOINT_PROFILE
 
     def output_mapping(self) -> dict[str, WorkflowBinding]:
         """Decode a fresh typed output mapping on every call."""
@@ -86,6 +89,7 @@ def compile_workflow(definition: WorkflowDefinition) -> WorkflowExecutionPlan:
         cloned = WorkflowDefinition.model_validate_json(frozen_definition)
         if any(node.max_attempts != 1 for node in cloned.nodes):
             raise WorkflowPlanError(WorkflowPlanError.RETRY_NOT_SUPPORTED)
+        cloned.require_execution_contract()
         ordered = cloned.ordered_nodes()
         node_plans: list[PlannedWorkflowNode] = []
         for node in ordered:

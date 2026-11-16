@@ -31,9 +31,27 @@ Agent 的模型策略显式使用 `interaction: "agent_turn"`。`request_profile
 | 切换默认版本 | POST `/capabilities/{key}/versions/{version}/set-default` |
 | 渲染 Prompt | POST `/prompts/{key}/versions/{version}/render` |
 
-Prompt 使用 `${variable}`，不执行 Python 表达式。能力 Schema 使用 JSON Schema Draft 2020-12，在隔离验证器中校验；只支持自包含 Schema 与本地引用，不检索外部引用。已发布 Workflow 可通过 `GET /capabilities/{key}/versions/{version}/plan` 获取从固定 DSL 即时编译的静态图元数据；该计划不是持久化发布制品、执行授权或任意代码，Worker 执行前仍会编译并进行运行时验证。发布能力不等于任务已执行。
+Prompt 使用 `${variable}`，不执行 Python 表达式。能力 Schema 使用 JSON Schema Draft 2020-12，在隔离验证器中校验；只支持自包含 Schema 与本地引用，不检索外部引用。已发布固定图 Workflow 可通过 `GET /capabilities/{key}/versions/{version}/plan` 获取从固定 DSL 即时编译的静态图元数据；该计划不是持久化发布制品、执行授权或任意代码，Worker 执行前仍会编译并进行运行时验证。发布能力不等于任务已执行。
+
+Workflow 定义可显式声明 `definition_version: "workflow.v1"`，省略时仍固定表示 V1。发布和执行使用同一语义契约；当前节点 `max_attempts` 只支持 `1`，不能配置尚未实现的原地重试。计划响应包含 `compiler_profile`、`interpreter_profile` 和 `checkpoint_profile`，供说明语义及检查点兼容性，不是运行授权或可由前端选择的执行引擎。
+
+同仓库业务包也可发布 `workflow.code.v1`，固定经审核的实现 Key/版本/来源摘要和活动资源依赖。本次尚未发布的契约细化使用 `CodeActivity` / `activities`，不是新协议版本或已发布定义的迁移；固定图 DSL 的 `nodes` 不变。代码流程的 `/plan` 响应为 `CodeWorkflowPlanRecord`，含 `control_flow: "code"`、实现引用、`activities` 和 `max_parallelism`，不含 Python 代码或虚构的静态 DAG；DSL 仍返回原 `WorkflowPlanRecord`。
+
+代码流程声明 1–99 个活动，`kind` 为 `step|agent|tool|llm|workflow`；除 step 外必须固定能力版本，只有 llm 可声明 Prompt。每项声明 `required`、`max_calls`（1–1000）、`timeout_seconds` 与 `on_unavailable: "fail"|"continue"`；定义级 `max_parallelism` 默认 4、上限 16。实际阶段、分支及重复调用由 Python 决定，公共接口统一为 `ctx.call`，有界并发使用 `ctx.parallel` / `ctx.map`。未调用的可选活动没有隐式 skipped 记录，声明数量不是执行节点数。
+
+Task 提交和查询入口不变。代码节点通过 `parent_node_id` 与 `scope` 表达层级；scope 包含流程 `workflow_key` / `version` / `content_hash`，调用还含 `activity_key` / `invocation_hash`。流程 frame 为 `result`，实际调用为 `step|agent|tool|llm|workflow`；节点终态 `unavailable` 附安全 `error_code`，表示部分证据不可用，不是 Task 状态、空业务结果或业务“clear”。continue 仅适用于白名单内已安全收敛的模型/只读工具失败，不能吞掉授权、租约、取消、账务、配置或未知检查点故障；未知外部结果不自动重放。
+
+子流程初期只接受已发布的固定版本代码 Workflow；`workflow:invoke` 在调用处重检并向后代继承。全部调用共享根 Task / Attempt / 租约和只能缩短的期限，不创建子 Task，代码 Workflow 不支持恢复、持久等待或审批。完整 Context、预算和完成校验契约见[业务能力 Hub](capability-hub.md)；单个示例验证不代表整个平台生产就绪。
+
+模型响应即使因格式、策略或内容被拒绝，已知的安全 Usage、实际模型、HTTP 状态及供应商请求 ID 仍会保存；它们不表示答案成功或费用已经核实。completion 的固定候选 fallback 仅适用于有明确持久证据的完整 429 拒绝且未报告 Usage；网络故障、超时、一般 5xx 或格式无效不自动重放，Agent turn 不自动重试。
+
+模型传输只协商 identity、gzip 或 deflate 单层编码，并检查压缩结束标记；截断或不支持的编码不视为完整响应。重复 JSON 字段和非有限数字不能作为接纳答案或授予 fallback 的依据。完整响应的安全元数据在连接清理前提取，清理失败仍不代表答案成功。
 
 Skill 是版本化的静态任务指引：创建 `kind: "skill"` 的能力并发布 `definition: {"instructions": "..."}`。Agent 定义用 `skills: [{"key": "...", "version": "..."}]` 固定引用，同时将相同版本列入 `dependencies`；每个 Agent 最多使用 8 个 Skill。服务身份必须具有对应的 `skill:use` Grant，平台在每次模型调用前及响应后重新检查。Skill 不支持脚本或可执行路径，也不授予任何工具权限；工具仍须单独授权。Skill 指引可能影响模型输出，但不是安全隔离机制。
+
+MCP 工具也可通过 Agent 的 `tools` 固定引用，但连接与 Schema pin 由 Worker 审核目录配置，不接受 Task 指定 endpoint。Pi 负责循环和工具选择，MCP 的实际连接、授权与留证仍经 Tool Gateway。完整配置示例及当前协议限制见 [Skills、MCP 与 Pi](agent-skills-mcp.md)。
+
+本地 Skill Markdown 可用 `skill-export` 预览、`skill-publish` 发布，支持 `SKILL.md` frontmatter 与普通 Markdown 正文；导入不执行脚本或自动授予工具。MCP 公开服务可省略 `credential_ref`；无远程输出 Schema 的文本工具可显式使用 `result_mode: "text"`，包装为 `{"text": "..."}`，默认结构化模式不变。
 
 评测运行均评分完成后，可通过 `GET /v2/projects/{project}/quality/runs/{left_id}/compare/{right_id}` 比较同一能力在同一数据集版本上的结果。接口单独返回技术执行成功数和评测规则通过数及逐样本状态，不返回样本输入；它们不等于业务采纳率或真实准确率。不同数据集或尚未完成评分的运行不能比较。
 
@@ -116,6 +134,8 @@ Content-Type: application/json
 ```
 
 需要事先创建并发布对应版本，具备 `task:submit`。`business_id` 和 `customer_id` 均可选，是调用方提供的关联标识，不是认证或客户访问授权；读取任务仍受项目、身份和能力授权约束。它们包含在幂等指纹内，重试同一请求时须保持不变，相同键异内容返回冲突。不要在标识中放入密钥或敏感明文。queued/claimed 不代表成功，HTTP 不启动 Worker。
+
+`queued` 不表示任何 Worker 都能执行：领取前会匹配固定制品所需的解释器、检查点、节点适配器和 Agent Runtime profile。不兼容的 Worker 不消耗 Attempt；任务等待适合的部署，不能仅为结束排队而自动换 Runtime 或放宽授权。该变化不新增 Task 状态或客户端选择执行器的参数。
 
 任务列表可按 `business_id` 或 `customer_id` 精确过滤；过滤不会扩大调用者可见范围。这只是任务关联查询，不等于客户档案或客户级权限体系。
 

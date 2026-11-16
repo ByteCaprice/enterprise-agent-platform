@@ -1,4 +1,4 @@
-"""The platform schema is explicit, self-contained and matches its frozen baseline."""
+"""The schema is explicit and self-contained, with a frozen baseline and increments."""
 
 import ast
 import re
@@ -9,6 +9,7 @@ from pathlib import Path
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateIndex, CreateTable
 
+from domain.governance import CapabilityAction
 from infra.store.model import platform_metadata
 
 
@@ -32,11 +33,47 @@ def test_platform_foreign_keys_resolve_only_within_platform_metadata():
             assert foreign_key.column.table.metadata is platform_metadata
 
 
-def test_frozen_baseline_covers_current_columns_constraints_and_indexes():
+def test_persisted_resource_grant_actions_match_the_domain_contract():
+    constraint = next(item for item in platform_metadata.tables["ai_resource_grant"].constraints
+                      if item.name == "ck_ai_resource_grant_action")
+    assert set(re.findall(r"'([^']+)'", str(constraint.sqltext))) == {action.value for action in CapabilityAction}
+
+
+def test_frozen_baseline_plus_explicit_increment_covers_columns_constraints_and_indexes():
     sql = (Path(__file__).resolve().parents[1] / "infra/platform_migrations/versions/schema.sql").read_text()
     sql = " ".join(sql.split())
     for table in platform_metadata.sorted_tables:
-        assert " ".join((str(CreateTable(table).compile(dialect=postgresql.dialect())).strip() + ";").split()) in sql
+        ddl = " ".join((str(CreateTable(table).compile(dialect=postgresql.dialect())).strip() + ";").split())
+        if table.name == "ai_platform_model_call":
+            # 0002 is additive; the frozen 0001 DDL must remain unchanged.
+            column = "outbound_evidence JSONB, "
+            constraint = (", CONSTRAINT ck_ai_platform_model_call_outbound_evidence CHECK "
+                          "(outbound_evidence IS NULL OR jsonb_typeof(outbound_evidence) = 'object')")
+            assert column in ddl and constraint in ddl
+            ddl = ddl.replace(column, "").replace(constraint, "")
+        if table.name == "ai_resource_grant":
+            assert "'agent:invoke','workflow:invoke'," in ddl
+            ddl = ddl.replace("'agent:invoke','workflow:invoke',", "'agent:invoke',")
+        if table.name == "ai_workflow_node":
+            # 0003 adds scoped, hierarchical activity evidence; 0001 stays frozen.
+            additions = (
+                "parent_node_id TEXT, ", "scope JSONB, ",
+                ", CONSTRAINT fk_ai_workflow_node_parent FOREIGN KEY(task_id, task_attempt_id, parent_node_id) REFERENCES ai_workflow_node (task_id, task_attempt_id, id)",
+                ", CONSTRAINT ck_ai_workflow_node_parent CHECK (parent_node_id IS NULL OR parent_node_id != id)",
+                ", CONSTRAINT ck_ai_workflow_node_scope CHECK (scope IS NULL OR jsonb_typeof(scope) = 'object')",
+            )
+            for addition in additions:
+                assert addition in ddl
+                ddl = ddl.replace(addition, "")
+            expanded = {
+                "kind IN ('rule','agent','tool','llm','step','result','workflow')": "kind IN ('rule','agent','tool','llm')",
+                "status IN ('running','succeeded','failed','skipped','unavailable','cancelled')": "status IN ('running','succeeded','failed','skipped','cancelled')",
+                "status IN ('failed','cancelled','unavailable')": "status IN ('failed','cancelled')",
+            }
+            for current, baseline in expanded.items():
+                assert current in ddl
+                ddl = ddl.replace(current, baseline)
+        assert ddl in sql
         for index in table.indexes:
             assert " ".join((str(CreateIndex(index).compile(dialect=postgresql.dialect())).strip() + ";").split()) in sql
 

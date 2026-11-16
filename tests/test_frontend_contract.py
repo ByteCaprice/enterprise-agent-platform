@@ -14,6 +14,7 @@ from starlette.exceptions import HTTPException
 from domain import ApiKeyConfig
 from domain.http_ingress import HTTPIngressPolicy
 from infra.platform_migrations import PLATFORM_SCHEMA_REVISION
+from interfaces import runtime
 from interfaces.cli import platform as cli
 from interfaces.http import platform_server
 from interfaces.http.api_contract import export_openapi, include_api_routes
@@ -27,7 +28,7 @@ def test_cli_exports_typed_authenticated_contract_without_runtime_initialization
     def forbidden(*args, **kwargs):
         raise AssertionError("Schema export must not initialize a runtime environment")
 
-    for name in ("load_settings", "build_engine", "create_platform_app"):
+    for name in ("load_settings", "build_engine", "create_runtime"):
         monkeypatch.setattr(cli, name, forbidden)
     cli.main(["export-openapi"])
     schema = json.loads(capsys.readouterr().out)
@@ -100,11 +101,11 @@ def test_runtime_schema_matches_offline_contract_and_reference_console_is_opt_in
 
     store = SimpleNamespace(engine=SimpleNamespace(connect=connect),
         api_key_configs=SimpleNamespace(list=lambda: [key]), governance=object(), oidc=None, close=Mock())
-    monkeypatch.setattr(platform_server, "load_settings", lambda _: {"database": {"schema": "isolated"}})
-    monkeypatch.setattr(platform_server, "validate_deployment", lambda *_: SimpleNamespace(http_ingress=HTTPIngressPolicy()))
-    monkeypatch.setattr(platform_server, "build_engine", lambda _: store.engine)
-    monkeypatch.setattr(platform_server, "PlatformStore", lambda _: store)
-    monkeypatch.setattr(platform_server, "check_validation_backend", lambda: None)
+    monkeypatch.setattr(runtime, "load_settings", lambda _: {"database": {"schema": "isolated"}})
+    monkeypatch.setattr(runtime, "validate_deployment", lambda *_: SimpleNamespace(http_ingress=HTTPIngressPolicy()))
+    monkeypatch.setattr(runtime, "build_engine", lambda _: store.engine)
+    monkeypatch.setattr(runtime, "PlatformStore", lambda _: store)
+    monkeypatch.setattr(runtime, "check_validation_backend", lambda: None)
     with TestClient(platform_server.create_platform_app("unused")) as client:
         assert client.get("/").status_code == client.get("/console/").status_code == 404
         assert client.get("/v2/session").status_code == 401
@@ -142,7 +143,7 @@ def test_service_key_response_projection_exposes_token_only_at_issuance():
 
 def test_reference_console_option_is_rejected_outside_serve_before_runtime_initialization(monkeypatch):
     initialize = Mock(side_effect=AssertionError("Must not initialize runtime"))
-    monkeypatch.setattr(cli, "create_platform_app", initialize)
+    monkeypatch.setattr(cli, "create_runtime", initialize)
     with pytest.raises(SystemExit) as error:
         cli.main(["export-openapi", "--reference-console"])
     assert error.value.code == 2

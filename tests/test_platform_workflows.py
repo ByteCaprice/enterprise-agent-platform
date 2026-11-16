@@ -9,13 +9,14 @@ import pytest
 from sqlalchemy import text
 from test_platform_tasks import ADMIN, service_identity, submit
 from test_platform_tasks import inbox as inbox_fixture
+from worker_support import worker_capabilities, worker_services, workflow_executor
 
 from domain.capability import CapabilitySpec, CapabilityVersionDraft
 from domain.task_execution import ExecutionFailure
+from infra.schema_validation import IsolatedJSONValidator
 from interfaces.cli.platform import main
 from orchestration.capability_service import CapabilityService
 from orchestration.platform_worker import PlatformWorker, WorkerPolicy
-from orchestration.workflow_executor import WorkflowExecutor
 
 inbox = inbox_fixture
 POLICY = WorkerPolicy(lease_seconds=20, heartbeat_seconds=0.2, execution_timeout_seconds=10,
@@ -39,7 +40,7 @@ def rule(key, operation="project", **kwargs):
 
 
 def publish_flow(store, nodes=None, *, definition=None, dependencies=(), output_schema=None):
-    service = CapabilityService(store.capabilities)
+    service = CapabilityService(store.capabilities, IsolatedJSONValidator())
     service.create("payments", CapabilitySpec(key="flow", kind="workflow", name="New deterministic flow"), "task-admin")
     service.create_draft("payments", "flow", CapabilityVersionDraft(
         version="1", definition=definition or {"nodes": nodes or [rule("project")]},
@@ -49,8 +50,9 @@ def publish_flow(store, nodes=None, *, definition=None, dependencies=(), output_
 
 
 def execute(store, executor=None, policy=POLICY):
-    executor = executor or WorkflowExecutor(store)
-    return asyncio.run(PlatformWorker(store, "workflow-integration", {"workflow": executor}, policy=policy).run_once())
+    executor = executor or workflow_executor(store)
+    return asyncio.run(PlatformWorker(worker_services(store), "workflow-integration", {"workflow": executor}, policy=policy,
+                                     capabilities=worker_capabilities("workflow", workflow_adapters=())).run_once())
 
 
 @pytest.mark.parametrize("account,allowed", [("synthetic-approved", True), ("synthetic-denied", False)])
@@ -107,13 +109,13 @@ def test_failed_node_is_identified_and_downstream_never_starts(inbox, case, erro
     assert nodes[0]["status"] == "failed" and nodes[0]["finish_time"] is not None
 
 
-@pytest.mark.parametrize("case,error", [("external", "WORKFLOW_ADAPTER_UNAVAILABLE"), ("retry", "WORKFLOW_RETRY_NOT_SUPPORTED")])
-def test_whole_graph_preflight_rejects_unsupported_execution_before_any_node(inbox, case, error):
+@pytest.mark.parametrize("case", ["external", "retry"])
+def test_unsupported_execution_never_consumes_attempt_or_starts_node(inbox, case):
     client, store = inbox
     nodes = [rule("before")]
     dependencies = []
     if case == "external":
-        service = CapabilityService(store.capabilities)
+        service = CapabilityService(store.capabilities, IsolatedJSONValidator())
         service.create("payments", CapabilitySpec(key="uninstalled-tool", kind="tool", name="Uninstalled"), "task-admin")
         service.create_draft("payments", "uninstalled-tool", CapabilityVersionDraft(
             version="1", definition={"binding_key": "uninstalled", "operation_type": "read_only"},
@@ -124,10 +126,15 @@ def test_whole_graph_preflight_rejects_unsupported_execution_before_any_node(inb
         dependencies = [{"key": "uninstalled-tool", "version": "1"}]
     else:
         nodes[0]["max_attempts"] = 2
+    if case == "retry":
+        with pytest.raises(ValueError):
+            publish_flow(store, nodes, dependencies=dependencies)
+        return
     publish_flow(store, nodes, dependencies=dependencies)
     target = submit(client, capability_key="flow").headers["Location"]
-    assert execute(store)
-    assert client.get(target + "/result", headers=ADMIN).json()["error_code"] == error
+    assert not execute(store)
+    assert client.get(target, headers=ADMIN).json()["status"] == "queued"
+    assert client.get(target + "/attempts", headers=ADMIN).json() == []
     assert client.get(target + "/nodes", headers=ADMIN).json() == []
 
 
@@ -136,13 +143,13 @@ def test_same_live_attempt_can_reuse_completed_checkpoints_without_duplicate_exe
     publish_flow(store, definition={"nodes": [rule("project", input_mapping={"name": input_value("/name")})],
                                     "output_mapping": {"name": node_value("project", "/name")}})
     target = submit(client, capability_key="flow").headers["Location"]
-    claim = store.tasks.claim("checkpoint-worker", kinds=("workflow",))
-    executor = WorkflowExecutor(store)
+    claim = store.task_queue.claim("checkpoint-worker", capabilities=worker_capabilities("workflow", workflow_adapters=()))
+    executor = workflow_executor(store)
     assert asyncio.run(executor(claim)) == {"name": "Synthetic customer"}
     events_before = len(store.logs.list_by_component("workflow_audit"))
     assert asyncio.run(executor(claim)) == {"name": "Synthetic customer"}
     assert len(store.logs.list_by_component("workflow_audit")) == events_before == 2
-    assert store.tasks.complete(claim.lease, status="succeeded", result={"name": "Synthetic customer"})
+    assert store.task_completion.complete(claim.lease, status="succeeded", result={"name": "Synthetic customer"})
     assert len(client.get(target + "/nodes", headers=ADMIN).json()) == 1
 
 
@@ -150,7 +157,7 @@ def test_node_timeout_is_independent_of_task_timeout(inbox, monkeypatch):
     client, store = inbox
     publish_flow(store, [rule("slow", timeout_seconds=0.01)])
     target = submit(client, capability_key="flow").headers["Location"]
-    executor = WorkflowExecutor(store)
+    executor = workflow_executor(store)
 
     async def slow(*_args):
         await asyncio.sleep(60)
@@ -167,7 +174,7 @@ def test_task_timeout_finalizes_running_node_atomically(inbox, monkeypatch):
     client, store = inbox
     publish_flow(store, [rule("slow")])
     target = submit(client, capability_key="flow").headers["Location"]
-    executor = WorkflowExecutor(store)
+    executor = workflow_executor(store)
     started = []
 
     async def slow(*_args):
@@ -201,7 +208,7 @@ def test_expired_node_write_is_fenced_and_recovery_preserves_completed_nodes(inb
     monkeypatch.setattr(store.workflows, "finish", lose_on_second)
     assert execute(store)
     assert client.get(target, headers=ADMIN).json()["status"] == "running"
-    assert store.tasks.recover_expired() == 1
+    assert store.task_queue.recover_expired() == 1
     nodes = client.get(target + "/nodes", headers=ADMIN).json()
     assert [node["status"] for node in nodes] == ["succeeded", "failed"]
     assert nodes[1]["error_code"] == "LEASE_EXPIRED_RESULT_UNKNOWN"
@@ -216,7 +223,7 @@ def test_pure_rule_recovery_reuses_verified_checkpoints_with_provenance(inbox, m
     ], "output_mapping": {"name": node_value("second", "/name")}}
     publish_flow(store, definition=definition)
     target = submit(client, capability_key="flow").headers["Location"]
-    failing = WorkflowExecutor(store)
+    failing = workflow_executor(store)
     perform = failing._perform
 
     async def fail_second(claim, node, outputs, node_id):
@@ -231,7 +238,7 @@ def test_pure_rule_recovery_reuses_verified_checkpoints_with_provenance(inbox, m
     recovery = client.post(target + "/recover", headers=ADMIN, json={"request_key": "retry"})
     assert recovery.status_code == 202
     recovery_url = "/v2/projects/payments/tasks/" + recovery.json()["id"]
-    resumed = WorkflowExecutor(store)
+    resumed = workflow_executor(store)
     original_perform = resumed._perform
     performed = []
 
@@ -263,7 +270,7 @@ def test_pure_rule_recovery_preserves_skipped_checkpoint(inbox, monkeypatch):
     publish_flow(store, definition={"nodes": [rule("first", when=literal(False)),
         rule("second", depends_on=["first"])], "output_mapping": {}})
     target = submit(client, capability_key="flow").headers["Location"]
-    failing = WorkflowExecutor(store)
+    failing = workflow_executor(store)
     perform = failing._perform
 
     async def fail_second(claim, node, outputs, node_id):

@@ -8,9 +8,14 @@ REQUIRED_ASSETS = {
     "infra": ("_schema_worker.py",),
     "interfaces.http": ("console/index.html", "console/app.js", "console/app.css", "console/icon.svg"),
     "infra.platform_migrations": (
+        "versions/0001_platform.py", "versions/0002_outbound_evidence.py",
         f"versions/{PLATFORM_SCHEMA_REVISION}.py", "versions/schema.sql",
     ),
     "framework.agent_runtime.pi": ("node/platform-runner.mjs", "node/package.json", "node/package-lock.json"),
+    "capability_hub": ("catalog.py",),
+    "capability_hub.remitter_search": (
+        "__init__.py", "agent.py", "bundle.py", "prompts.py", "schemas.py", "steps.py", "tools.py", "workflow.py",
+    ),
 }
 
 

@@ -1,7 +1,6 @@
 """Non-streaming Agent-turn parser on the same pinned HTTPS egress as completion."""
 
 import asyncio
-import re
 
 from domain.agent_turn import (
     AgentAssistantMessage,
@@ -12,9 +11,10 @@ from domain.agent_turn import (
     AgentTurnResponse,
     strict_json,
 )
-from domain.platform_model import ModelTransportFailure, ModelUsage
+from domain.outbound_operation import OutboundEvidence, evidence_from_exception
+from domain.platform_model import ModelTransportFailure
 from domain.task import canonical_json
-from infra.model_http import OpenAICompatibleTransport, response_usage
+from infra.model_http import OpenAICompatibleTransport, response_evidence, response_usage
 
 
 def provider_messages(conversation):
@@ -32,16 +32,13 @@ def provider_messages(conversation):
 
 
 def parse_turn_response(body, status, request_id):
-    actual_model = None
-    usage = ModelUsage()
+    evidence = response_evidence(None, status, request_id)
     code = "MODEL_RESPONSE_INVALID"
     try:
         data = strict_json(body)
-        model = data.get("model")
-        if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/+@-]{0,199}", model):
-            actual_model = model
-        usage = response_usage(data.get("usage"))
-        if actual_model is None or not isinstance(data.get("choices"), list) or len(data["choices"]) != 1:
+        evidence = response_evidence(data, status, request_id)
+        response_usage(data.get("usage"))
+        if evidence.actual_model is None or not isinstance(data.get("choices"), list) or len(data["choices"]) != 1:
             raise ValueError
         choice = data["choices"][0]
         message = choice["message"]
@@ -69,9 +66,10 @@ def parse_turn_response(body, status, request_id):
             turn = AgentModelTurn(kind="final", text=content)
         else:
             raise ValueError
-        return AgentTurnResponse(turn=turn, actual_model=actual_model, usage=usage, http_status=status, request_id=request_id)
+        return AgentTurnResponse(turn=turn, actual_model=evidence.actual_model, usage=evidence.usage,
+                                 http_status=status, request_id=request_id)
     except Exception:
-        return AgentTurnResponse(error_code=code, actual_model=actual_model, usage=usage,
+        return AgentTurnResponse(error_code=code, actual_model=evidence.actual_model, usage=evidence.usage,
                                  http_status=status, request_id=request_id)
 
 
@@ -84,18 +82,20 @@ class AgentTurnHTTPTransport(OpenAICompatibleTransport):
                 if request.request_profile == "openrouter_non_reasoning":
                     payload["reasoning"] = {"enabled": False, "exclude": True}
                 elif request.request_profile != "openai_chat":
-                    raise ModelTransportFailure("MODEL_REQUEST_PROFILE_UNSUPPORTED")
+                    raise ModelTransportFailure("MODEL_REQUEST_PROFILE_UNSUPPORTED",
+                                                evidence=OutboundEvidence(dispatch="not_dispatched"))
                 if request.temperature is not None:
                     payload["temperature"] = request.temperature
                 if request.tools:
                     payload.update({"tools": [{"type": "function", "function": {
                         "name": tool.alias, "description": tool.description, "parameters": tool.input_schema,
                     }} for tool in request.tools], "tool_choice": "auto", "parallel_tool_calls": False})
-                body, status, request_id = await self._post_json(request.base_url, request.secret, payload)
+                body, status, request_id = await self._post_json(
+                    request.base_url, request.secret, payload, timeout_seconds=request.timeout_seconds)
                 return parse_turn_response(body, status, request_id)
         except (ModelTransportFailure, asyncio.CancelledError):
             raise
-        except TimeoutError:
-            raise ModelTransportFailure("MODEL_UPSTREAM_TIMEOUT") from None
+        except TimeoutError as exc:
+            raise ModelTransportFailure("MODEL_UPSTREAM_TIMEOUT", evidence=evidence_from_exception(exc)) from None
         except Exception:
             raise ModelTransportFailure("MODEL_REQUEST_REJECTED") from None

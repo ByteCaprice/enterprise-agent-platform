@@ -26,6 +26,8 @@ class AiWorkflowNode(Base):
     output_hash: Mapped[str | None] = mapped_column(Text)
     output: Mapped[dict[str, Any] | None] = mapped_column(JSON_VARIANT)
     reused_from_node_id: Mapped[str | None] = mapped_column(ForeignKey("ai_workflow_node.id"))
+    parent_node_id: Mapped[str | None] = mapped_column(Text)
+    scope: Mapped[dict[str, Any] | None] = mapped_column(JSON_VARIANT(none_as_null=True))
     start_time: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     finish_time: Mapped[datetime | None] = mapped_column(UTCDateTime)
     error_code: Mapped[str | None] = mapped_column(Text)
@@ -38,14 +40,21 @@ class AiWorkflowNode(Base):
         ),
         UniqueConstraint("task_attempt_id", "node_key", name="uk_ai_workflow_node_attempt_key"),
         UniqueConstraint("task_id", "task_attempt_id", "id", name="uk_ai_workflow_node_task_attempt_id"),
-        CheckConstraint("kind IN ('rule','agent','tool','llm')", name="ck_ai_workflow_node_kind"),
-        CheckConstraint("status IN ('running','succeeded','failed','skipped','cancelled')", name="ck_ai_workflow_node_status"),
+        ForeignKeyConstraint(
+            ["task_id", "task_attempt_id", "parent_node_id"],
+            ["ai_workflow_node.task_id", "ai_workflow_node.task_attempt_id", "ai_workflow_node.id"],
+            name="fk_ai_workflow_node_parent",
+        ),
+        CheckConstraint("parent_node_id IS NULL OR parent_node_id != id", name="ck_ai_workflow_node_parent"),
+        CheckConstraint("scope IS NULL OR jsonb_typeof(scope) = 'object'", name="ck_ai_workflow_node_scope"),
+        CheckConstraint("kind IN ('rule','agent','tool','llm','step','result','workflow')", name="ck_ai_workflow_node_kind"),
+        CheckConstraint("status IN ('running','succeeded','failed','skipped','unavailable','cancelled')", name="ck_ai_workflow_node_status"),
         CheckConstraint(
             "input_hash ~ '^[0-9a-f]{64}$' AND (output_hash IS NULL OR output_hash ~ '^[0-9a-f]{64}$')",
             name="ck_ai_workflow_node_hashes",
         ),
         CheckConstraint(
-            "(status = 'running' AND finish_time IS NULL AND output IS NULL AND output_hash IS NULL AND error_code IS NULL) OR (status = 'succeeded' AND finish_time IS NOT NULL AND output IS NOT NULL AND output_hash IS NOT NULL AND error_code IS NULL) OR (status = 'skipped' AND finish_time IS NOT NULL AND output IS NULL AND output_hash IS NULL AND error_code IS NULL) OR (status IN ('failed','cancelled') AND finish_time IS NOT NULL AND output IS NULL AND output_hash IS NULL AND error_code IS NOT NULL AND error_code ~ '^[A-Z][A-Z0-9_]{0,99}$')",
+            "(status = 'running' AND finish_time IS NULL AND output IS NULL AND output_hash IS NULL AND error_code IS NULL) OR (status = 'succeeded' AND finish_time IS NOT NULL AND output IS NOT NULL AND output_hash IS NOT NULL AND error_code IS NULL) OR (status = 'skipped' AND finish_time IS NOT NULL AND output IS NULL AND output_hash IS NULL AND error_code IS NULL) OR (status IN ('failed','cancelled','unavailable') AND finish_time IS NOT NULL AND output IS NULL AND output_hash IS NULL AND error_code IS NOT NULL AND error_code ~ '^[A-Z][A-Z0-9_]{0,99}$')",
             name="ck_ai_workflow_node_terminal",
         ),
         CheckConstraint("finish_time IS NULL OR finish_time >= start_time", name="ck_ai_workflow_node_time"),
