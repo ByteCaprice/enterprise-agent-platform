@@ -13,12 +13,15 @@ import subprocess
 from pathlib import Path
 
 from infra.database import build_engine
+from infra.deployment_policy import validate_deployment
 from infra.platform_migrations.runner import upgrade_platform
 from interfaces.platform_settings import load_settings
 
 
 def backup(config_dir, output=None, *, apply=False):
-    config = load_settings(config_dir).get("database", {})
+    bootstrap = load_settings(config_dir)
+    validate_deployment(bootstrap, config_dir)
+    config = bootstrap.get("database", {})
     schema = config.get("schema")
     if not isinstance(schema, str) or not re.fullmatch(r"enterprise_ai(?:_[a-z0-9_]{1,40})?", schema):
         raise ValueError("Backup requires an isolated enterprise_ai schema")
@@ -40,6 +43,8 @@ def backup(config_dir, output=None, *, apply=False):
     env.update({"PGHOST": str(config["host"]), "PGPORT": str(config.get("port", 5432)), "PGDATABASE": str(config["name"]),
         "PGUSER": str(config["user"]), "PGPASSWORD": str(config["password"]),
         "PGSSLMODE": str(config.get("sslmode", "prefer")), "PGCONNECT_TIMEOUT": "10"})
+    if env["PGSSLMODE"] == "verify-full":
+        env["PGGSSENCMODE"] = "disable"
     if config.get("sslrootcert"):
         env["PGSSLROOTCERT"] = str(config["sslrootcert"])
     # A failed dump remains an incomplete archive without a success manifest.

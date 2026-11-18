@@ -38,6 +38,13 @@ python -m pytest --noconftest -q tests/test_task_contracts.py tests/test_layerin
 python -m pytest -m 'not database' -q
 ```
 
+发布安全测试使用 `dev` extra；MCP 协议一致性测试另需 `mcp` extra，其中的 Python SDK 1.x 仅用于进程内测试服务器，不是生产依赖。以下锁定版本的检查不需要 Pi、数据库或外部工具：
+
+```bash
+uv run --locked --extra dev --extra mcp pytest -m 'not database and not live_llm' -q \
+  tests/test_platform_release_safety.py tests/test_platform_mcp.py
+```
+
 只运行与修改范围对应的小型检查，不自动调用付费模型、真实工具或业务系统。数据库验证另行授权，只操作专用隔离 schema；不自动迁移持久应用环境。不要为通过检查而放松授权、租约、幂等或证据约束。
 
 数据库测试使用 `--sit-config=/path/to/private-test-config.txt` 显式选择 SIT 测试环境，仅创建和清理会话拥有的随机 schema。未提供该选项时数据库测试跳过，不自动启动 Docker 或连接任何默认数据库。测试只装配平台 metadata，不依赖本地业务配置、插件目录或私有 demo。

@@ -17,6 +17,8 @@ enterprise-ai check-config --config-dir /path/to/platform-config
 
 数据库、模型及 Callback 凭据通过明确的私有配置/环境引用提供，不能嵌入能力定义。模板不是可直接生产运行的部署配置。
 
+生产模式要求 `DATABASE__SSLMODE=verify-full` 和单个显式 TCP `DATABASE__HOST`；不允许 Unix socket 或主机回退列表。应用、迁移和备份都执行此配置检查。挂载受信任的 CA 证书并通过 `DATABASE__SSLROOTCERT` 指定，或使用 libpq 的默认信任根文件；连接时校验数据库证书与主机名。试用模式保留本地开发选项。
+
 ## 初始化与升级
 
 平台迁移目录为 `infra/platform_migrations/`，初始化 baseline 为 `0001_platform`，固定 SQL 位于 `versions/schema.sql`。只在获批的空隔离 schema 中初始化；应用启动不会创建表、导入业务 seed 或自动修改 schema。
@@ -63,7 +65,7 @@ API 不自动启动 Worker。API 与 Task Worker 启动时会进行本地 Schema
 
 MCP 目录、Tool binding、Agent 的 tools/skills 引用和对应 Grant 是分别配置的环节；文件校验不会探测远程服务或自动授予工具。当前只支持受控 Streamable HTTP JSON 只读工具，不是任意 MCP 服务即插即用。详见 [Skills、MCP 与 Pi 配置](agent-skills-mcp.md)。
 
-Task Worker 从实际安装的节点适配器和已检查 Runtime 形成不可变能力清单，领取前核对固定制品及相关依赖要求的语义 profile，而非只看执行角色。根 Agent 和内嵌 Agent 都需要匹配的 Runtime；当前 V1 只定义 `pi → enterprise-ai.pi.v1`。不兼容或制品完整性异常的任务仍排队，不消耗 Attempt，不自动安装代码或切换 Runtime。部署需覆盖实际能力需求；现有健康心跳中的角色/存活是粗粒度观察，不是 profile 兼容证书或执行授权。工具 binding/handler、Provider 和凭据仍在实际调用时检查。
+Task Worker 从实际安装的节点适配器和已检查 Runtime 形成不可变能力清单，领取前核对固定制品及相关依赖要求的语义 profile，而非只看执行角色。根 Agent 和内嵌 Agent 都需要匹配的 Runtime；当前 V1 只定义 `pi → enterprise-ai.pi.v1`。不兼容或制品完整性异常的任务仍排队，不消耗 Attempt，不自动安装代码或切换 Runtime。部署需覆盖实际能力需求；健康心跳中的能力清单只用于观察，不是执行授权。工具 binding/handler、Provider 和凭据仍在实际调用时检查。
 
 `--hub-bundles` 仅从同发行物的显式业务目录安装代码，不读取数据库中的模块路径。代码流程/工具还要求实现 Key、版本、来源摘要完全相同；发布新业务版本不让旧 Worker 自动兼容。源码变化后重新发布并部署对应实现，不通过线上热改文件切换历史版本。具体命令与发布/授权边界见[业务能力 Hub](capability-hub.md)。
 
@@ -83,7 +85,7 @@ docker compose -f docker/platform/compose.yaml up -d api workflow recovery
 
 先检查配置再启动。Compose 的 Recovery Worker 独立于执行 Worker 运行，用于在执行 Worker 全部停止时继续收敛失租任务；它不重新执行任务，也不判断未知外部操作是否成功。Agent 和 Callback 服务使用独立的 `agents` / `callbacks` profile，按需显式开启；不要仅为让任务结束而给所有 Worker 配置全量凭据或权限。Recovery Worker 也须纳入进程状态监控。
 
-API 默认仅绑定宿主 loopback。应用 ingress 配置提供单进程请求体/头/目标大小、读写超时和并发边界；这些是传输资源限制，不是租户配额、Task deadline 或多实例共享限流。TLS、边缘请求限制与共享限流、秘密管理、备份保护和网络出口由部署设施提供并按环境配置。
+API 默认仅绑定宿主 loopback。应用 ingress 配置提供单进程请求体/头/目标大小、读写超时和并发边界；这些是传输资源限制，不是租户配额、Task deadline 或多实例共享限流。应用内身份限流在认证之后执行，不能保护认证入口。生产部署必须由受信任的边缘层在认证前实施跨实例共享限流、请求大小限制和入口 TLS，并限制对 API 进程的直接访问。秘密管理、备份保护和网络出口仍由部署设施提供。
 
 ## 环境策略
 
@@ -94,6 +96,9 @@ API 默认仅绑定宿主 loopback。应用 ingress 配置提供单进程请求�
 - `/livez` 检查 API 响应；`/readyz` 检查数据库版本和必要表，不代表 Worker 正常消费。
 - `enterprise-ai health --project <project> --config-dir ...` 返回运行汇总；退出0表示ok，1表示attention，2表示查询故障。初始化失败另会非零退出，监控也须捕获。
 - 健康数据包含队列等待、缺失执行角色、失租、取消未确认、unknown费用和Callback死信，可供已有监控采集，不默认向外部告警平台发送数据。
+- 项目健康接口与 CLI 的 `queue_readiness` 仅读取启用项目最早入队的 32 个任务（同一入队时间按 ID 排序），最多查找 128 次固定制品，并使用最多 1000 个新鲜且标记为运行中的 Worker 心跳。同一 Worker 必须同时覆盖执行类型、所有精确 profile 和按流程/工具角色区分的代码实现 Key/版本/来源摘要。响应只列出有问题的任务 ID、原因与采样统计，不返回清单、定义或任务输入。`queue_truncated`、`worker_list_truncated` 表示观察不完整，不能由 `ok` 推断整条队列就绪。
+- `QUEUED_TASK_NO_COMPATIBLE_WORKER` 表示已解析需求但未观察到匹配 Worker；`QUEUED_TASK_REQUIREMENTS_UNAVAILABLE` 表示固定制品缺失、无效或无法解析；`QUEUED_TASK_COMPATIBILITY_UNKNOWN` 表示没有观察到匹配，但可能有未列出的 Worker、相关 Worker 尚无有效清单（如旧版本或清单超过 128 项），或已达到制品查找上限。告警计数仅限样本。即使观察到匹配也不代表可立即领取，不检查并发配额、实时授权、绑定或供应商状态。
+- 新 Worker 启动时在现有心跳 JSON 中写入内部清单，不需要迁移。滚动更新时先更新 API/CLI 健康读取端，再重启 Task Worker；新版读取端兼容旧心跳，并只在 `executors` 返回执行类型。
 - Worker 的 DB 心跳只作观察，不替代 TaskAttempt 租约。DB/观察故障时停止进程，由 supervisor 重启；不在原进程盲目重试未知事务或业务调用。
 - SIGTERM 停止新领取，允许有界在途执行收尾；不能回收时保留结果未知，不伪造取消确认。
 - 排障使用 X-Request-ID 和安全元数据，不打开原始凭据/客户输入输出日志。

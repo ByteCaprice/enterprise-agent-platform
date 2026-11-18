@@ -8,7 +8,9 @@ from sqlalchemy import text
 from test_platform_tasks import ADMIN, service_identity, submit
 from test_platform_tasks import inbox as inbox_fixture
 from test_platform_tools import accept, grant, setup_tool
+from worker_support import worker_capabilities
 
+from domain.execution_requirements import AGENT_INTERPRETER_PROFILE, InstalledExecutionCapabilities
 from infra.deployment_policy import validate_deployment
 from interfaces.worker.platform import run_workflow_worker
 
@@ -25,11 +27,29 @@ def test_health_pagination_errors_and_local_readonly_scenario(inbox, monkeypatch
     response = client.get(ROOT + "/operations/health", headers=ADMIN)
     assert response.status_code == 200, response.text
     assert {"code": "WORKER_MISSING", "roles": ["agent"]} in response.json()["alerts"]
+    task_id = task.json()["id"]
+    assert response.json()["queue_readiness"]["issues"] == [{"task_id": task_id, "reason": "no_compatible_worker"}]
     instance = store.worker_health.start("fixture-agent", "task", ("agent",))
-    assert not any(a["code"] == "WORKER_MISSING" for a in client.get(ROOT + "/operations/health", headers=ADMIN).json()["alerts"])
+    legacy = client.get(ROOT + "/operations/health", headers=ADMIN).json()
+    assert not any(a["code"] == "WORKER_MISSING" for a in legacy["alerts"])
+    assert legacy["queue_readiness"]["issues"] == [{"task_id": task_id, "reason": "worker_coverage_unknown"}]
+    store.worker_health.heartbeat(instance, "stopped")
+    incompatible = InstalledExecutionCapabilities.from_descriptors(("agent",), agent_interpreter_profile=AGENT_INTERPRETER_PROFILE)
+    store.worker_health.start("missing-runtime", "task", ("agent",), capabilities=incompatible)
+    health = client.get(ROOT + "/operations/health", headers=ADMIN).json()
+    assert {"code": "QUEUED_TASK_NO_COMPATIBLE_WORKER", "count": 1} in health["alerts"]
+    assert not any(a["code"] == "WORKER_MISSING" for a in health["alerts"])
+    instance = store.worker_health.start("fixture-agent", "task", ("agent",), capabilities=worker_capabilities("agent"))
+    health = client.get(ROOT + "/operations/health", headers=ADMIN).json()
+    assert health["queue_readiness"]["compatible"] == 1 and not health["queue_readiness"]["issues"]
+    assert store.worker_health.live(worker_id="fixture-agent")[0]["executors"] == ["agent"]
     with store.engine.begin() as connection:
         connection.execute(text("UPDATE ai_worker_health SET heartbeat_at=clock_timestamp()-interval '60 seconds'"))
     assert not store.worker_health.live(worker_id="fixture-agent")
+    stale = client.get(ROOT + "/operations/health", headers=ADMIN).json()
+    assert {"code": "QUEUED_TASK_NO_COMPATIBLE_WORKER", "count": 1} in stale["alerts"]
+    with store.engine.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM ai_task_attempt WHERE task_id=:task"), {"task": task_id}) == 0
     store.worker_health.heartbeat(instance, "stopped")
 
     for key in ("one", "two", "three"):
@@ -78,7 +98,8 @@ def test_production_gate_requires_explicit_policy_without_network(tmp_path):
     policy["shared_edge_limits_confirmed"] = True
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(policy))
-    settings = {"platform_runtime": {"mode": "production", "policy_file": str(path)}}
+    settings = {"platform_runtime": {"mode": "production", "policy_file": str(path)},
+                "database": {"host": "db.example.test", "sslmode": "verify-full"}}
     assert validate_deployment(settings, tmp_path).mode == "production"
     policy["retention_policy_ref"] = ""
     path.write_text(json.dumps(policy))

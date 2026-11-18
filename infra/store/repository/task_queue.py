@@ -18,46 +18,48 @@ from infra.store.repository.execution_convergence import converge_execution_evid
 from infra.store.repository.execution_effects import record_task_transition
 
 
-class TaskQueueRepository(BaseRepository):
-    @staticmethod
-    def _requirements(session, task, *, lock=False):
-        """Read actual stored identities and pins, optionally locking versions.
+def read_task_requirements(session, task, *, lock=False, before_load=None):
+    """Read actual stored identities and pins, optionally locking versions.
 
-        Identity keys/kinds and published content are immutable through the API.
-        Final claim inspection share-locks only version rows: locking identities
-        here would invert publishers' identity-before-dependency-version order.
-        Discovery takes no row locks. Both paths use only bounded pure parsing
-        and database reads, never schema subprocesses or execution adapters.
-        """
-        def load(key=None, version=None):
-            query = select(AiCapability, AiCapabilityVersion).join(
-                AiCapabilityVersion, AiCapabilityVersion.capability_id == AiCapability.id,
-            ).where(AiCapability.project_key == task.project_key)
-            if key is None:
-                query = query.where(AiCapability.id == task.capability_id, AiCapabilityVersion.version == task.version)
-            else:
-                query = query.where(AiCapability.key == key, AiCapabilityVersion.version == version)
-            if lock:
-                query = query.with_for_update(read=True, of=AiCapabilityVersion)
-            result = session.execute(query.execution_options(populate_existing=True)).one_or_none()
-            if result is None:
-                return None
-            identity, row = result
-            return ExecutionArtifact(identity.id, identity.key, identity.kind, row.to_domain())
-
-        try:
-            root = load()
-            if root is None:
-                raise ExecutionRequirementsUnavailable("Pinned root artifact is unavailable")
-            requirements = required_execution_profiles(
-                root, version=task.version, content_hash=task.content_hash, resolve=load,
-            )
-            return root, requirements
-        except (ValueError, TypeError, KeyError, RecursionError):
-            # Invalid storage is not executable and must not poison the queue
-            # head. Leave it queued for operator repair, without an Attempt.
+    Identity keys/kinds and published content are immutable through the API.
+    Final claim inspection share-locks only version rows: locking identities
+    here would invert publishers' identity-before-dependency-version order.
+    Discovery and health take no row locks. Health can bound its total lookups
+    via before_load; claim always uses the full domain inspection bounds.
+    """
+    def load(key=None, version=None):
+        if before_load is not None:
+            before_load()
+        query = select(AiCapability, AiCapabilityVersion).join(
+            AiCapabilityVersion, AiCapabilityVersion.capability_id == AiCapability.id,
+        ).where(AiCapability.project_key == task.project_key)
+        if key is None:
+            query = query.where(AiCapability.id == task.capability_id, AiCapabilityVersion.version == task.version)
+        else:
+            query = query.where(AiCapability.key == key, AiCapabilityVersion.version == version)
+        if lock:
+            query = query.with_for_update(read=True, of=AiCapabilityVersion)
+        result = session.execute(query.execution_options(populate_existing=True)).one_or_none()
+        if result is None:
             return None
+        identity, row = result
+        return ExecutionArtifact(identity.id, identity.key, identity.kind, row.to_domain())
 
+    try:
+        root = load()
+        if root is None:
+            raise ExecutionRequirementsUnavailable("Pinned root artifact is unavailable")
+        requirements = required_execution_profiles(
+            root, version=task.version, content_hash=task.content_hash, resolve=load,
+        )
+        return root, requirements
+    except (ValueError, TypeError, KeyError, RecursionError):
+        # Invalid storage is not executable and must not poison the queue
+        # head. Leave it queued for operator repair, without an Attempt.
+        return None
+
+
+class TaskQueueRepository(BaseRepository):
     @staticmethod
     def _global_full(session):
         from infra.store.model.ai_operations import AiGlobalConcurrency
@@ -116,7 +118,7 @@ class TaskQueueRepository(BaseRepository):
                 return None, False
             # Rebuild requirements from the locked Task's actual stored pins.
             # No detached discovery evidence authorizes this mutation.
-            inspected = self._requirements(session, selected, lock=True)
+            inspected = read_task_requirements(session, selected, lock=True)
             if inspected is None or not capabilities.supports(inspected[1]):
                 return None, False
             root = inspected[0]
@@ -194,7 +196,7 @@ class TaskQueueRepository(BaseRepository):
             for candidate in candidates:
                 cursor = (candidate.create_time, candidate.id)
                 with self._read() as session:
-                    inspected = self._requirements(session, candidate)
+                    inspected = read_task_requirements(session, candidate)
                 if inspected is None or not capabilities.supports(inspected[1]):
                     continue
                 claim, global_full = self._claim_candidate(candidate, worker_id, capabilities, lease_seconds)

@@ -30,7 +30,7 @@ def authenticated_principal(request: Request, x_api_key: Annotated[str | None, S
         raise HTTPException(status_code=401, detail="Platform API key required")
     limiter = request.app.state.rate_limiter
     # Bucket by identity, not token: rotation cannot multiply the allowance.
-    if limiter.settings.get("enabled") and not limiter.is_allowed(f"{entry.identity_id or 'admin'}:{entry.name}"):
+    if not limiter.is_allowed(f"{entry.identity_id or 'admin'}:{entry.name}"):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
     return entry
 

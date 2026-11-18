@@ -163,4 +163,4 @@ async def run_platform_worker(store, *, execution_kinds: tuple[str, ...] = ("wor
     with stop_signals(stop):
         return await observe_worker(store, worker.worker_id, "task",
             worker.run_once if once else lambda: worker.run(stop),
-            executors=execution_kinds, workflow_agents=workflow_agents)
+            executors=execution_kinds, workflow_agents=workflow_agents, capabilities=capabilities)

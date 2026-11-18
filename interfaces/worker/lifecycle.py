@@ -27,8 +27,9 @@ def stop_signals(stop):
             signal.signal(signum, old)
 
 
-async def observe_worker(store, worker_id, role, run, *, executors=(), workflow_agents=False):
-    instance = await asyncio.to_thread(store.worker_health.start, worker_id, role, executors, workflow_agents)
+async def observe_worker(store, worker_id, role, run, *, executors=(), workflow_agents=False, capabilities=None):
+    instance = await asyncio.to_thread(store.worker_health.start, worker_id, role, executors, workflow_agents,
+                                       capabilities=capabilities)
 
     async def heartbeat():
         while True:

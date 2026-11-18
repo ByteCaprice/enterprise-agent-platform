@@ -9,6 +9,7 @@ import logging
 import re
 
 from infra.database import build_engine
+from infra.deployment_policy import validate_deployment
 from infra.mcp_catalog import catalog_metadata, load_mcp_catalog
 from infra.platform_migrations.runner import upgrade_platform
 from infra.release_checks import check_installed_assets
@@ -146,16 +147,19 @@ def main(argv=None):
         print(json.dumps({"tools": catalog_metadata(catalog)}))
         return
     if args.command == "migrate":
-        database = load_settings(args.config_dir).get("database", {})
-        engine = build_engine(database)
         try:
-            result = upgrade_platform(engine, database.get("schema"), apply=args.apply)
+            bootstrap = load_settings(args.config_dir)
+            validate_deployment(bootstrap, args.config_dir)
+            database = bootstrap.get("database", {})
+            engine = build_engine(database)
+            try:
+                result = upgrade_platform(engine, database.get("schema"), apply=args.apply)
+            finally:
+                engine.dispose()
         except Exception as exc:
             # Driver errors can contain database credentials or customer input.
             print(f"Platform upgrade failed ({type(exc).__name__}); no credentials displayed")
             raise SystemExit(1) from None
-        finally:
-            engine.dispose()
         print(json.dumps(result))
         return
     try:

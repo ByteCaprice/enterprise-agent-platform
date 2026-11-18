@@ -212,7 +212,7 @@ enterprise-ai worker --once --config-dir /path/to/platform-config
 | `/v2/projects/{project}/operations/retention-inventory?before=<RFC3339>` | 管理员只读留存盘点；返回观测计数，不判断可删除性，也不执行删除 |
 | `/operations/budgets`、`/operations/charges` | 显式预算周期、费用及未知费用核对 |
 | `/operations/callbacks`、`/operations/deliveries` | 签名终态通知端点及投递状态 |
-| `/operations/health` | 管理员可读运行健康与告警输入 |
+| `/operations/health` | 管理员可读运行健康与告警；`queue_readiness` 对排队任务抽样检查 Worker 兼容性，不授予执行权。见[健康与故障](deployment.md#健康与故障) |
 | `/quality/datasets`、`/quality/runs` | 不可变评测集、批次及显式评分 |
 | `/memory`、`/memory/{capability}/{subject}` | 当前身份的记忆修订与读取 |
 | `/oidc/bindings`、`/oidc/unbind` | 主体与现有服务身份的明确绑定/撤销 |

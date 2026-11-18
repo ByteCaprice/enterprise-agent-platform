@@ -21,7 +21,7 @@ from scripts import backup_platform, build_platform_release
 
 def test_backup_is_explicit_private_and_never_overwrites(tmp_path, monkeypatch):
     config = {"host": "synthetic.invalid", "name": "synthetic", "user": "fixture", "password": "synthetic-secret",
-              "schema": "enterprise_ai_fixture"}
+              "schema": "enterprise_ai_fixture", "sslmode": "verify-full", "sslrootcert": "/etc/database/root.crt"}
     monkeypatch.setattr(backup_platform, "load_settings", lambda _: {"database": config})
     monkeypatch.setattr(backup_platform, "build_engine", lambda _: SimpleNamespace(dispose=lambda: None))
     monkeypatch.setattr(backup_platform, "upgrade_platform", lambda *_args: {"from_revision": PLATFORM_SCHEMA_REVISION})
@@ -31,6 +31,9 @@ def test_backup_is_explicit_private_and_never_overwrites(tmp_path, monkeypatch):
         calls.append(command)
         assert "synthetic-secret" not in repr(command)
         assert options["env"]["PGPASSWORD"] == "synthetic-secret"
+        assert options["env"]["PGSSLMODE"] == "verify-full"
+        assert options["env"]["PGGSSENCMODE"] == "disable"
+        assert options["env"]["PGSSLROOTCERT"] == "/etc/database/root.crt"
         assert "--schema=enterprise_ai_fixture" in command
         options["stdout"].write(b"synthetic-archive-only")
 

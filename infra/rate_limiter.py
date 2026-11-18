@@ -49,8 +49,12 @@ class RateLimiter:
             self.settings = dict(settings)
             self._buckets.clear()
 
-    def _get_bucket(self, caller: str) -> TokenBucket:
+    def is_allowed(self, caller: str) -> bool:
+        # Policy lookup, refill and consumption must be atomic with respect to
+        # other requests, metrics reads and reconfiguration.
         with self._lock:
+            if not self.settings.get("enabled", False):
+                return True
             if caller not in self._buckets:
                 caller_limits = self.settings.get("callers", {})
                 default_limits = self.settings.get("default", {})
@@ -58,12 +62,7 @@ class RateLimiter:
                 capacity = float(limits.get("capacity", 100))
                 fill_rate = float(limits.get("fill_rate", 10))
                 self._buckets[caller] = TokenBucket(capacity=capacity, fill_rate=fill_rate)
-            return self._buckets[caller]
-
-    def is_allowed(self, caller: str) -> bool:
-        if not self.settings.get("enabled", False):
-            return True
-        return self._get_bucket(caller).consume()
+            return self._buckets[caller].consume()
 
     def metrics(self) -> dict[str, Any]:
         with self._lock:

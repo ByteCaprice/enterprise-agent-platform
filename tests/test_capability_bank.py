@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 
 import pytest
 from conftest import make_store
@@ -20,6 +19,7 @@ from domain.capability import (
     CapabilityVersionDraft,
 )
 from domain.governance import ProjectCreate
+from infra.rate_limiter import RateLimiter
 from infra.schema_validation import IsolatedJSONValidator
 from interfaces.http.routes.capabilities import router
 from orchestration.capability_service import CapabilityService
@@ -179,7 +179,7 @@ def api_client(keys):
             scopes=key["scopes"],
         ))
     app.state.control_plane_auth = ControlPlaneAuth(app.state.store.api_key_configs, app.state.store.governance)
-    app.state.rate_limiter = SimpleNamespace(settings={"enabled": False})
+    app.state.rate_limiter = RateLimiter()
     app.include_router(router)
     return TestClient(app)
 

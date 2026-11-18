@@ -17,6 +17,7 @@ from domain.execution_requirements import (
 )
 from domain.task_worker import WorkerServices
 from domain.workflow_runtime import WorkflowAdapterDescriptor, WorkflowNodeRegistry
+from infra.rate_limiter import RateLimiter
 from interfaces.http.routes.capabilities import router
 from orchestration.control_plane_auth import ControlPlanePrincipal
 from orchestration.platform_worker import PlatformWorker
@@ -88,7 +89,7 @@ def test_plan_endpoint_is_authenticated_metadata_only_and_does_not_execute():
         authenticate=lambda token: principal if token == "synthetic-key" else None,
         allowed_resources=lambda *_: {"*"},
     )
-    app.state.rate_limiter = SimpleNamespace(settings={"enabled": False})
+    app.state.rate_limiter = RateLimiter()
     app.include_router(router)
     path = "/v2/projects/demo/capabilities/flow/versions/1/plan"
     with TestClient(app) as client:

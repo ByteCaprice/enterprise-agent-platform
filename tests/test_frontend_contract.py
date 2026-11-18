@@ -14,6 +14,7 @@ from starlette.exceptions import HTTPException
 from domain import ApiKeyConfig
 from domain.http_ingress import HTTPIngressPolicy
 from infra.platform_migrations import PLATFORM_SCHEMA_REVISION
+from infra.rate_limiter import RateLimiter
 from interfaces import runtime
 from interfaces.cli import platform as cli
 from interfaces.http import platform_server
@@ -74,7 +75,7 @@ def test_session_api_is_independent_of_console_and_still_requires_one_live_crede
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.state.control_plane_auth = SimpleNamespace(authenticate=authenticate,
         authenticate_bearer=lambda token: principal if token == "synthetic-jwt" else None)
-    app.state.rate_limiter = SimpleNamespace(settings={"enabled": False})
+    app.state.rate_limiter = RateLimiter()
     with TestClient(app) as client:
         assert client.get("/v2/session").status_code == 401
         for headers in ({"x-api-key": "synthetic-key"}, {"Authorization": "Bearer synthetic-jwt"}):

@@ -20,6 +20,12 @@ def build_engine(config: dict[str, Any]):
     port = int(config.get("port", 5432))
     dbname = config.get("name") or config.get("database") or config.get("dbname") or ""
     sslmode = config.get("sslmode", "prefer")
+    query = {"sslmode": sslmode}
+    if sslmode == "verify-full":
+        # libpq otherwise prefers GSS encryption over TLS when available.
+        query["gssencmode"] = "disable"
+    if config.get("sslrootcert"):
+        query["sslrootcert"] = config["sslrootcert"]
 
     url = URL.create(
         "postgresql+psycopg2",
@@ -28,7 +34,7 @@ def build_engine(config: dict[str, Any]):
         host=host,
         port=port,
         database=dbname,
-        query={"sslmode": sslmode, **({"sslrootcert": config["sslrootcert"]} if config.get("sslrootcert") else {})},
+        query=query,
     )
     connect_args: dict[str, Any] = {"connect_timeout": int(config.get("connect_timeout_seconds", 10))}
     schema = config.get("schema")
